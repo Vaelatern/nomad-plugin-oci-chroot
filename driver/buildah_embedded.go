@@ -103,6 +103,25 @@ func (b *embeddedBuildahBackend) From(ctx context.Context, image string) (string
 	return containerID, nil
 }
 
+func (b *embeddedBuildahBackend) Inspect(ctx context.Context, image string) (*ImageConfig, error) {
+	ref, err := name.ParseReference(image)
+	if err != nil {
+		return nil, fmt.Errorf("parse reference %s: %w", image, err)
+	}
+	img, err := remote.Image(ref)
+	if err != nil {
+		return nil, fmt.Errorf("remote image %s: %w", image, err)
+	}
+	cf, err := img.ConfigFile()
+	if err != nil {
+		return nil, fmt.Errorf("config file %s: %w", image, err)
+	}
+	return &ImageConfig{
+		Entrypoint: cf.Config.Entrypoint,
+		Cmd:        cf.Config.Cmd,
+	}, nil
+}
+
 func (b *embeddedBuildahBackend) Mount(ctx context.Context, containerID string) (string, error) {
 	b.mu.Lock()
 	rootfs, ok := b.roots[containerID]

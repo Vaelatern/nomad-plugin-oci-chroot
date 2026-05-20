@@ -200,9 +200,6 @@ func (d *OCIDriver) StartTask(cfg *drivers.TaskConfig) (*drivers.TaskHandle, *dr
 	if taskConfig.Image == "" {
 		return nil, nil, fmt.Errorf("image is required")
 	}
-	if taskConfig.Command == "" {
-		taskConfig.Command = "/bin/sh"
-	}
 
 	image := taskConfig.Image
 
@@ -212,6 +209,46 @@ func (d *OCIDriver) StartTask(cfg *drivers.TaskConfig) (*drivers.TaskHandle, *dr
 	if err := d.backend.Pull(pullCtx, image, taskConfig.ForcePull); err != nil {
 		return nil, nil, fmt.Errorf("failed to pull image %s: %v", image, err)
 	}
+
+	useDefaultCommand := taskConfig.Command == ""
+	useDefaultArgs := len(taskConfig.Args) == 0
+
+	if useDefaultCommand || useDefaultArgs {
+		inspectCtx, inspectCancel := context.WithTimeout(d.ctx, 30*time.Second)
+		defer inspectCancel()
+		imgConfig, err := d.backend.Inspect(inspectCtx, image)
+		if err != nil {
+			d.logger.Warn("failed to inspect image, using hardcoded defaults", "image", image, "err", err)
+		} else {
+			if useDefaultCommand {
+				if len(imgConfig.Entrypoint) > 0 {
+					taskConfig.Command = imgConfig.Entrypoint[0]
+					if useDefaultArgs {
+						taskConfig.Args = append(imgConfig.Entrypoint[1:], imgConfig.Cmd...)
+					}
+				} else if len(imgConfig.Cmd) > 0 {
+					taskConfig.Command = imgConfig.Cmd[0]
+					if useDefaultArgs {
+						taskConfig.Args = imgConfig.Cmd[1:]
+					}
+				}
+			} else if useDefaultArgs && len(imgConfig.Entrypoint) > 0 {
+				taskConfig.Args = imgConfig.Cmd
+			}
+		}
+
+		if taskConfig.Command == "" {
+			taskConfig.Command = "/bin/sh"
+		}
+	}
+
+	d.logger.Info("resolved command",
+		"image", image,
+		"command", taskConfig.Command,
+		"args", taskConfig.Args,
+		"default_command", useDefaultCommand,
+		"default_args", useDefaultArgs,
+	)
 
 	fromCtx, fromCancel := context.WithTimeout(d.ctx, buildahTimeout)
 	defer fromCancel()

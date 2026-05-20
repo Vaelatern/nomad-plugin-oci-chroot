@@ -2,6 +2,7 @@ package driver
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os/exec"
 	"strings"
@@ -46,6 +47,28 @@ func (b *cliBuildahBackend) Unmount(ctx context.Context, containerID string) err
 
 func (b *cliBuildahBackend) Remove(ctx context.Context, containerID string) error {
 	return buildahRunContext(ctx, "rm", containerID)
+}
+
+func (b *cliBuildahBackend) Inspect(ctx context.Context, image string) (*ImageConfig, error) {
+	out, err := buildahOutputContext(ctx, "inspect", "--type", "image", image)
+	if err != nil {
+		return nil, err
+	}
+	var result struct {
+		OCIv1 struct {
+			Config struct {
+				Entrypoint []string `json:"Entrypoint"`
+				Cmd        []string `json:"Cmd"`
+			} `json:"config"`
+		} `json:"OCIv1"`
+	}
+	if err := json.Unmarshal([]byte(out), &result); err != nil {
+		return nil, fmt.Errorf("parse buildah inspect output: %w", err)
+	}
+	return &ImageConfig{
+		Entrypoint: result.OCIv1.Config.Entrypoint,
+		Cmd:        result.OCIv1.Config.Cmd,
+	}, nil
 }
 
 func buildahVersion() string {
