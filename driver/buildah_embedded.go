@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -15,6 +16,10 @@ import (
 	"github.com/google/go-containerregistry/pkg/v1/remote"
 )
 
+// errLog is a logger that writes to stderr so messages from the embedded
+// backend appear in Nomad client logs.
+var errLog = log.New(os.Stderr, "[oci-chroot] ", log.LstdFlags|log.Lmsgprefix)
+
 type embeddedBuildahBackend struct {
 	mu         sync.Mutex
 	roots      map[string]string
@@ -23,9 +28,12 @@ type embeddedBuildahBackend struct {
 
 func newEmbeddedBuildahBackend() (*embeddedBuildahBackend, error) {
 	storageDir := filepath.Join(os.TempDir(), "oci-chroot-store")
+	errLog.Printf("initializing embedded backend, storage dir: %s", storageDir)
 	if err := os.MkdirAll(storageDir, 0755); err != nil {
+		errLog.Printf("failed to create storage directory: %v", err)
 		return nil, fmt.Errorf("create storage dir: %w", err)
 	}
+	errLog.Printf("storage directory ready: %s", storageDir)
 	return &embeddedBuildahBackend{
 		roots:      make(map[string]string),
 		storageDir: storageDir,
@@ -43,79 +51,105 @@ func (b *embeddedBuildahBackend) Available() (bool, string) {
 }
 
 func (b *embeddedBuildahBackend) Pull(ctx context.Context, image string, force bool) error {
+	errLog.Printf("pull: parsing image reference: %s", image)
 	ref, err := name.ParseReference(image)
 	if err != nil {
+		errLog.Printf("pull: failed to parse image reference %s: %v", image, err)
 		return fmt.Errorf("parse reference %s: %w", image, err)
 	}
+	errLog.Printf("pull: reference parsed: %s", ref.String())
 
 	// Verify the image is accessible by checking its manifest
+	errLog.Printf("pull: fetching manifest descriptor for %s", image)
 	desc, err := remote.Get(ref)
 	if err != nil {
+		errLog.Printf("pull: failed to fetch %s: %v", image, err)
 		return fmt.Errorf("pull %s: %w", image, err)
 	}
-	_ = desc
+	errLog.Printf("pull: image accessible — digest: %s, media type: %s", desc.Digest.String(), desc.MediaType)
 	return nil
 }
 
 func (b *embeddedBuildahBackend) From(ctx context.Context, image string) (string, error) {
+	errLog.Printf("from: parsing image reference: %s", image)
 	ref, err := name.ParseReference(image)
 	if err != nil {
+		errLog.Printf("from: failed to parse image reference %s: %v", image, err)
 		return "", fmt.Errorf("parse reference %s: %w", image, err)
 	}
+	errLog.Printf("from: resolved reference: %s", ref.String())
 
+	errLog.Printf("from: fetching image metadata for %s", image)
 	img, err := remote.Image(ref)
 	if err != nil {
+		errLog.Printf("from: failed to fetch image %s: %v", image, err)
 		return "", fmt.Errorf("remote image %s: %w", image, err)
 	}
+	errLog.Printf("from: image metadata fetched")
 
 	// Get image digest for a unique container ID
 	digest, err := img.Digest()
 	if err != nil {
+		errLog.Printf("from: failed to get image digest: %v", err)
 		return "", fmt.Errorf("get digest: %w", err)
 	}
 	containerID := digest.Hex[:16]
+	errLog.Printf("from: image digest computed, container ID: %s", containerID)
 
 	rootfs := filepath.Join(b.storageDir, containerID)
+	errLog.Printf("from: rootfs path: %s", rootfs)
 
 	// Skip extraction if already exists
 	if _, err := os.Stat(rootfs); err == nil {
+		errLog.Printf("from: rootfs already extracted, reusing cached copy at %s", rootfs)
 		b.mu.Lock()
 		b.roots[containerID] = rootfs
 		b.mu.Unlock()
 		return containerID, nil
 	}
+	errLog.Printf("from: rootfs not cached, extracting layers...")
 
 	if err := os.MkdirAll(rootfs, 0755); err != nil {
+		errLog.Printf("from: failed to create rootfs directory %s: %v", rootfs, err)
 		return "", fmt.Errorf("mkdir rootfs: %w", err)
 	}
 
 	// Extract image layers to rootfs directory
+	errLog.Printf("from: starting layer extraction to %s", rootfs)
 	rc := mutate.Extract(img)
 	if err := extractTarStream(rc, rootfs); err != nil {
+		errLog.Printf("from: layer extraction failed: %v", err)
 		os.RemoveAll(rootfs)
 		return "", fmt.Errorf("extract image: %w", err)
 	}
+	errLog.Printf("from: layer extraction complete")
 
 	b.mu.Lock()
 	b.roots[containerID] = rootfs
 	b.mu.Unlock()
 
+	errLog.Printf("from: container ready — id=%s rootfs=%s", containerID, rootfs)
 	return containerID, nil
 }
 
 func (b *embeddedBuildahBackend) Inspect(ctx context.Context, image string) (*ImageConfig, error) {
+	errLog.Printf("inspect: fetching config for image %s", image)
 	ref, err := name.ParseReference(image)
 	if err != nil {
+		errLog.Printf("inspect: failed to parse reference %s: %v", image, err)
 		return nil, fmt.Errorf("parse reference %s: %w", image, err)
 	}
 	img, err := remote.Image(ref)
 	if err != nil {
+		errLog.Printf("inspect: failed to fetch image %s: %v", image, err)
 		return nil, fmt.Errorf("remote image %s: %w", image, err)
 	}
 	cf, err := img.ConfigFile()
 	if err != nil {
+		errLog.Printf("inspect: failed to read config file for %s: %v", image, err)
 		return nil, fmt.Errorf("config file %s: %w", image, err)
 	}
+	errLog.Printf("inspect: entrypoint=%v cmd=%v", cf.Config.Entrypoint, cf.Config.Cmd)
 	return &ImageConfig{
 		Entrypoint: cf.Config.Entrypoint,
 		Cmd:        cf.Config.Cmd,
@@ -123,27 +157,39 @@ func (b *embeddedBuildahBackend) Inspect(ctx context.Context, image string) (*Im
 }
 
 func (b *embeddedBuildahBackend) Mount(ctx context.Context, containerID string) (string, error) {
+	errLog.Printf("mount: looking up container %s", containerID)
 	b.mu.Lock()
 	rootfs, ok := b.roots[containerID]
 	b.mu.Unlock()
 	if !ok {
+		errLog.Printf("mount: container %s not found in local store", containerID)
 		return "", fmt.Errorf("container %s not found", containerID)
 	}
+	errLog.Printf("mount: container %s -> %s", containerID, rootfs)
 	return rootfs, nil
 }
 
 func (b *embeddedBuildahBackend) Unmount(ctx context.Context, containerID string) error {
+	errLog.Printf("unmount: (no-op for embedded backend) container %s", containerID)
 	return nil
 }
 
 func (b *embeddedBuildahBackend) Remove(ctx context.Context, containerID string) error {
+	errLog.Printf("remove: cleaning up container %s", containerID)
 	b.mu.Lock()
 	rootfs, ok := b.roots[containerID]
 	delete(b.roots, containerID)
 	b.mu.Unlock()
 
 	if ok && rootfs != "" {
-		return os.RemoveAll(rootfs)
+		errLog.Printf("remove: deleting rootfs at %s", rootfs)
+		if err := os.RemoveAll(rootfs); err != nil {
+			errLog.Printf("remove: failed to delete rootfs %s: %v", rootfs, err)
+			return err
+		}
+		errLog.Printf("remove: rootfs deleted")
+	} else {
+		errLog.Printf("remove: no rootfs path found for container %s", containerID)
 	}
 	return nil
 }

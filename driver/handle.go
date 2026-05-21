@@ -45,6 +45,7 @@ func (h *taskHandle) monitor(ctx context.Context) {
 	go func() {
 		state, err := ps.Wait()
 		if err != nil {
+			h.logger.Error("process Wait failed", "pid", ps.Pid, "error", err)
 			waitCh <- &drivers.ExitResult{
 				ExitCode: 1,
 				Err:      err,
@@ -67,8 +68,15 @@ func (h *taskHandle) monitor(ctx context.Context) {
 		h.exitResult = res
 		h.completedAt = time.Now()
 		h.state = drivers.TaskStateExited
+		h.logger.Info("task exited",
+			"pid", ps.Pid,
+			"exit_code", res.ExitCode,
+			"signal", res.Signal,
+			"error", res.Err,
+		)
 		h.ch <- res
 	case <-h.doneCh:
+		h.logger.Warn("task kill requested, sending SIGKILL", "pid", ps.Pid)
 		ps.Signal(syscall.SIGKILL)
 		ps.Wait()
 		h.done = true
@@ -79,6 +87,7 @@ func (h *taskHandle) monitor(ctx context.Context) {
 			Signal:   int(syscall.SIGKILL),
 		}
 	case <-ctx.Done():
+		h.logger.Warn("monitor context cancelled, sending SIGKILL", "pid", ps.Pid)
 		ps.Signal(syscall.SIGKILL)
 		ps.Wait()
 		h.done = true

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"os/exec"
 	"strings"
 	"time"
@@ -80,19 +81,32 @@ func buildahVersion() string {
 }
 
 func buildahRunContext(ctx context.Context, args ...string) error {
+	cmdStr := "buildah " + strings.Join(args, " ")
 	cmd := exec.CommandContext(ctx, "buildah", args...)
+	fmt.Fprintf(os.Stderr, "[oci-chroot] running: %s\n", cmdStr)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
+		fmt.Fprintf(os.Stderr, "[oci-chroot] buildah command failed:\n  command: %s\n  error: %v\n  output: %s\n", cmdStr, err, string(out))
 		return fmt.Errorf("buildah %s: %v\n%s", strings.Join(args, " "), err, string(out))
+	}
+	if len(out) > 0 {
+		fmt.Fprintf(os.Stderr, "[oci-chroot] buildah output: %s\n", strings.TrimSpace(string(out)))
 	}
 	return nil
 }
 
 func buildahOutputContext(ctx context.Context, args ...string) (string, error) {
+	cmdStr := "buildah " + strings.Join(args, " ")
 	cmd := exec.CommandContext(ctx, "buildah", args...)
+	fmt.Fprintf(os.Stderr, "[oci-chroot] running: %s\n", cmdStr)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
+		fmt.Fprintf(os.Stderr, "[oci-chroot] buildah command failed:\n  command: %s\n  error: %v\n  output: %s\n", cmdStr, err, string(out))
 		return "", fmt.Errorf("buildah %s: %v\n%s", strings.Join(args, " "), err, string(out))
 	}
-	return strings.TrimSpace(string(out)), nil
+	result := strings.TrimSpace(string(out))
+	if len(result) > 0 {
+		fmt.Fprintf(os.Stderr, "[oci-chroot] buildah output: %s\n", result)
+	}
+	return result, nil
 }

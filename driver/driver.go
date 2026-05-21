@@ -76,31 +76,49 @@ func (d *OCIDriver) SetConfig(c *base.Config) error {
 	d.configLock.Lock()
 	defer d.configLock.Unlock()
 
+	d.logger.Debug("SetConfig called", "plugin_config_bytes", len(c.PluginConfig))
+
 	var config Config
 	if len(c.PluginConfig) > 0 {
 		if err := base.MsgPackDecode(c.PluginConfig, &config); err != nil {
+			d.logger.Error("failed to decode plugin config", "error", err)
 			return err
 		}
 	}
 	d.config = &config
 
+	d.logger.Info("plugin config loaded",
+		"enabled", config.Enabled,
+		"host_buildah", config.HostBuildah,
+	)
+
 	// Initialize buildah backend based on config
 	if d.config.HostBuildah {
-		d.logger.Info("using host buildah binary")
+		d.logger.Info("using host buildah binary for image operations")
 		d.backend = &cliBuildahBackend{}
+		// Check if buildah is actually available
+		if ok, reason := d.backend.Available(); !ok {
+			d.logger.Warn("buildah binary not found but host_buildah=true", "reason", reason)
+		} else {
+			ver, _ := d.backend.Version()
+			d.logger.Info("host buildah detected", "version", ver)
+		}
 	} else {
-		d.logger.Info("using embedded buildah (go-containerregistry)")
+		d.logger.Info("using embedded buildah backend (go-containerregistry) — no external dependencies")
 		backend, err := newEmbeddedBuildahBackend()
 		if err != nil {
+			d.logger.Error("failed to create embedded buildah backend", "error", err)
 			return fmt.Errorf("failed to create embedded buildah backend: %v", err)
 		}
 		d.backend = backend
+		ver, _ := d.backend.Version()
+		d.logger.Debug("embedded backend initialized", "version", ver)
 	}
 
 	if d.config.Enabled {
-		d.logger.Info(d.pluginName + " driver enabled")
+		d.logger.Info("oci-chroot driver is ENABLED")
 	} else {
-		d.logger.Info(d.pluginName + " driver disabled")
+		d.logger.Warn("oci-chroot driver is DISABLED — tasks using this driver will fail")
 	}
 
 	return nil
@@ -131,6 +149,8 @@ func (d *OCIDriver) Fingerprint(ctx context.Context) (<-chan *drivers.Fingerprin
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
 
+		var lastHealth drivers.HealthState
+
 		for {
 			health := drivers.HealthStateHealthy
 			desc := drivers.DriverHealthy
@@ -153,6 +173,15 @@ func (d *OCIDriver) Fingerprint(ctx context.Context) (<-chan *drivers.Fingerprin
 			} else {
 				health = drivers.HealthStateUndetected
 				desc = "backend not initialized (SetConfig not called)"
+			}
+
+			if health != lastHealth {
+				d.logger.Info("fingerprint health changed",
+					"from", lastHealth,
+					"to", health,
+					"description", desc,
+				)
+				lastHealth = health
 			}
 
 			select {
@@ -201,97 +230,163 @@ func (d *OCIDriver) StartTask(cfg *drivers.TaskConfig) (*drivers.TaskHandle, *dr
 		return nil, nil, fmt.Errorf("image is required")
 	}
 
+	d.logger.Debug("decoded task config",
+		"image", taskConfig.Image,
+		"command", taskConfig.Command,
+		"args", taskConfig.Args,
+		"bind_sockets", taskConfig.BindSockets,
+		"force_pull", taskConfig.ForcePull,
+	)
+
 	image := taskConfig.Image
 
+	d.logger.Info("starting image pull",
+		"image", image,
+		"force_pull", taskConfig.ForcePull,
+		"backend", d.backend.Name(),
+	)
 	pullCtx, pullCancel := context.WithTimeout(d.ctx, buildahTimeout)
 	defer pullCancel()
-	d.logger.Info("pulling image", "image", image)
 	if err := d.backend.Pull(pullCtx, image, taskConfig.ForcePull); err != nil {
-		return nil, nil, fmt.Errorf("failed to pull image %s: %v", image, err)
+		errMsg := fmt.Errorf("failed to pull image %s: %v", image, err)
+		d.logger.Error("image pull failed", "image", image, "error", err)
+		return nil, nil, errMsg
 	}
+	d.logger.Info("image pull succeeded", "image", image)
 
 	useDefaultCommand := taskConfig.Command == ""
 	useDefaultArgs := len(taskConfig.Args) == 0
 
 	if useDefaultCommand || useDefaultArgs {
+		d.logger.Debug("inspecting image for Entrypoint/Cmd defaults",
+			"image", image,
+			"use_default_command", useDefaultCommand,
+			"use_default_args", useDefaultArgs,
+		)
 		inspectCtx, inspectCancel := context.WithTimeout(d.ctx, 30*time.Second)
 		defer inspectCancel()
 		imgConfig, err := d.backend.Inspect(inspectCtx, image)
 		if err != nil {
-			d.logger.Warn("failed to inspect image, using hardcoded defaults", "image", image, "err", err)
+			d.logger.Warn("failed to inspect image metadata — falling back to hardcoded /bin/sh",
+				"image", image, "error", err,
+			)
 		} else {
+			d.logger.Debug("image metadata",
+				"image", image,
+				"entrypoint", imgConfig.Entrypoint,
+				"cmd", imgConfig.Cmd,
+			)
+
 			if useDefaultCommand {
 				if len(imgConfig.Entrypoint) > 0 {
 					taskConfig.Command = imgConfig.Entrypoint[0]
+					d.logger.Debug("using ENTRYPOINT[0] as command",
+						"entrypoint0", imgConfig.Entrypoint[0],
+					)
 					if useDefaultArgs {
 						taskConfig.Args = append(imgConfig.Entrypoint[1:], imgConfig.Cmd...)
+						d.logger.Debug("using ENTRYPOINT[1:]+CMD as args",
+							"args", taskConfig.Args,
+						)
 					}
 				} else if len(imgConfig.Cmd) > 0 {
 					taskConfig.Command = imgConfig.Cmd[0]
+					d.logger.Debug("using CMD[0] as command (no ENTRYPOINT)",
+						"cmd0", imgConfig.Cmd[0],
+					)
 					if useDefaultArgs {
 						taskConfig.Args = imgConfig.Cmd[1:]
+						d.logger.Debug("using CMD[1:] as args", "args", taskConfig.Args)
 					}
+				} else {
+					d.logger.Debug("image has no ENTRYPOINT or CMD, falling back to /bin/sh")
 				}
 			} else if useDefaultArgs && len(imgConfig.Entrypoint) > 0 {
 				taskConfig.Args = imgConfig.Cmd
+				d.logger.Debug("user provided command but not args — using image CMD as default args",
+					"cmd", imgConfig.Cmd,
+				)
 			}
 		}
 
 		if taskConfig.Command == "" {
 			taskConfig.Command = "/bin/sh"
+			d.logger.Debug("command still empty after inspection, defaulting to /bin/sh")
 		}
 	}
 
-	d.logger.Info("resolved command",
+	d.logger.Info("resolved task command",
 		"image", image,
 		"command", taskConfig.Command,
 		"args", taskConfig.Args,
-		"default_command", useDefaultCommand,
-		"default_args", useDefaultArgs,
+		"from_image_defaults", useDefaultCommand || useDefaultArgs,
 	)
 
 	fromCtx, fromCancel := context.WithTimeout(d.ctx, buildahTimeout)
 	defer fromCancel()
-	d.logger.Info("creating container from image", "image", image)
+	d.logger.Info("extracting image layers to chroot directory", "image", image, "timeout", buildahTimeout)
 	containerName, err := d.backend.From(fromCtx, image)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to create container from %s: %v", image, err)
+		errMsg := fmt.Errorf("failed to extract image %s: %v", image, err)
+		d.logger.Error("image extraction failed", "image", image, "error", err)
+		return nil, nil, errMsg
 	}
-	d.logger.Info("container created", "name", containerName)
+	d.logger.Info("image extracted", "container_id", containerName, "image", image)
 
 	mountCtx, mountCancel := context.WithTimeout(d.ctx, 30*time.Second)
 	defer mountCancel()
+	d.logger.Debug("mounting container rootfs", "container_id", containerName)
 	mountPoint, err := d.backend.Mount(mountCtx, containerName)
 	if err != nil {
+		d.logger.Error("mount failed, cleaning up container", "container_id", containerName, "error", err)
 		rmCtx, rmCancel := context.WithTimeout(d.ctx, 30*time.Second)
 		defer rmCancel()
 		d.backend.Remove(rmCtx, containerName)
 		return nil, nil, fmt.Errorf("failed to mount container %s: %v", containerName, err)
 	}
-	d.logger.Info("container mounted", "mountpoint", mountPoint)
+	d.logger.Info("chroot rootfs ready", "mountpoint", mountPoint, "container_id", containerName)
 
 	selfExe, err := os.Executable()
 	if err != nil {
+		d.logger.Error("cannot determine own executable path", "error", err)
 		cleanupCtx, cleanupCancel := context.WithTimeout(d.ctx, 30*time.Second)
 		defer cleanupCancel()
 		d.backend.Unmount(cleanupCtx, containerName)
 		d.backend.Remove(cleanupCtx, containerName)
 		return nil, nil, fmt.Errorf("failed to get self path: %v", err)
 	}
+	d.logger.Debug("self executable path", "path", selfExe)
 
 	argsJSON, _ := json.Marshal(taskConfig.Args)
 	argsB64 := base64.StdEncoding.EncodeToString(argsJSON)
 	socketsJSON, _ := json.Marshal(taskConfig.BindSockets)
 	socketsB64 := base64.StdEncoding.EncodeToString(socketsJSON)
 
+	// Bind-mount task directories from Nomad into the chroot.
+	// Nomad's template stanza writes rendered templates to /local and /secrets,
+	// so these mounts make template-rendered content available inside the chroot.
 	taskDir := filepath.Join(cfg.AllocDir, cfg.Name)
 	dirs := map[string]string{
 		"/alloc":   filepath.Join(cfg.AllocDir, "alloc"),
 		"/local":   filepath.Join(taskDir, "local"),
 		"/secrets": filepath.Join(taskDir, "secrets"),
 	}
+	d.logger.Info("bind-mounting Nomad directories into chroot",
+		"alloc_dir", dirs["/alloc"],
+		"local_dir", dirs["/local"],
+		"secrets_dir", dirs["/secrets"],
+		"note", "template stanzas write to /local and /secrets — they are available inside the chroot",
+	)
 	dirsJSON, _ := json.Marshal(dirs)
 	dirsB64 := base64.StdEncoding.EncodeToString(dirsJSON)
+
+	if len(taskConfig.BindSockets) > 0 {
+		d.logger.Info("bind-mounting host sockets into chroot",
+			"sockets", taskConfig.BindSockets,
+		)
+	} else {
+		d.logger.Debug("no host sockets to bind-mount")
+	}
 
 	env := cfg.EnvList()
 	env = append(env,
@@ -302,8 +397,14 @@ func (d *OCIDriver) StartTask(cfg *drivers.TaskConfig) (*drivers.TaskHandle, *dr
 		"_OCI_CHROOT_BIND_SOCKETS="+socketsB64,
 		"_OCI_CHROOT_DIRS="+dirsB64,
 	)
+	d.logger.Debug("task environment prepared",
+		"env_count", len(env),
+		"alloc_id", cfg.AllocID,
+		"task_name", cfg.Name,
+	)
 
 	cleanup := func() {
+		d.logger.Debug("cleaning up container after failed start", "container_id", containerName)
 		c, cancel := context.WithTimeout(d.ctx, 30*time.Second)
 		defer cancel()
 		d.backend.Unmount(c, containerName)
@@ -312,15 +413,21 @@ func (d *OCIDriver) StartTask(cfg *drivers.TaskConfig) (*drivers.TaskHandle, *dr
 
 	stdoutW, err := os.OpenFile(cfg.StdoutPath, os.O_WRONLY, 0)
 	if err != nil {
+		d.logger.Error("failed to open stdout FIFO", "path", cfg.StdoutPath, "error", err)
 		cleanup()
 		return nil, nil, fmt.Errorf("failed to open stdout FIFO: %v", err)
 	}
 	stderrW, err := os.OpenFile(cfg.StderrPath, os.O_WRONLY, 0)
 	if err != nil {
+		d.logger.Error("failed to open stderr FIFO", "path", cfg.StderrPath, "error", err)
 		stdoutW.Close()
 		cleanup()
 		return nil, nil, fmt.Errorf("failed to open stderr FIFO: %v", err)
 	}
+	d.logger.Debug("stdout/stderr FIFOs opened",
+		"stdout", cfg.StdoutPath,
+		"stderr", cfg.StderrPath,
+	)
 
 	cmd := exec.Command(selfExe)
 	cmd.Env = env
@@ -328,7 +435,16 @@ func (d *OCIDriver) StartTask(cfg *drivers.TaskConfig) (*drivers.TaskHandle, *dr
 	cmd.Stderr = stderrW
 	cmd.Stdin = nil
 
+	d.logger.Info("spawning chroot process",
+		"pid", "pending",
+		"command", taskConfig.Command,
+		"args", taskConfig.Args,
+		"mountpoint", mountPoint,
+		"container_id", containerName,
+	)
+
 	if err := cmd.Start(); err != nil {
+		d.logger.Error("failed to spawn chroot process", "error", err)
 		stdoutW.Close()
 		stderrW.Close()
 		cleanup()
@@ -337,7 +453,14 @@ func (d *OCIDriver) StartTask(cfg *drivers.TaskConfig) (*drivers.TaskHandle, *dr
 	stdoutW.Close()
 	stderrW.Close()
 
-	d.logger.Info("task started", "pid", cmd.Process.Pid, "container", containerName, "backend", d.backend.Name())
+	d.logger.Info("chroot process running",
+		"pid", cmd.Process.Pid,
+		"container_id", containerName,
+		"image", image,
+		"backend", d.backend.Name(),
+		"command", taskConfig.Command,
+		"args", taskConfig.Args,
+	)
 
 	handle := &taskHandle{
 		taskConfig:    cfg,
@@ -381,15 +504,19 @@ func (d *OCIDriver) WaitTask(ctx context.Context, taskID string) (<-chan *driver
 }
 
 func (d *OCIDriver) StopTask(taskID string, timeout time.Duration, signal string) error {
+	d.logger.Debug("StopTask called", "task_id", taskID, "timeout", timeout, "signal", signal)
+
 	d.tasksLock.Lock()
 	handle, ok := d.tasks[taskID]
 	d.tasksLock.Unlock()
 
 	if !ok {
+		d.logger.Warn("StopTask: task not found", "task_id", taskID)
 		return fmt.Errorf("task not found: %s", taskID)
 	}
 
 	if handle.done {
+		d.logger.Debug("StopTask: task already finished", "task_id", taskID)
 		return nil
 	}
 
@@ -403,11 +530,14 @@ func (d *OCIDriver) StopTask(taskID string, timeout time.Duration, signal string
 		}
 	}
 
+	d.logger.Info("sending signal to task", "task_id", taskID, "signal", sig, "pid", handle.proc.Pid)
 	handle.proc.Signal(sig)
 	if timeout > 0 {
+		d.logger.Debug("will force-kill after timeout", "task_id", taskID, "timeout", timeout)
 		go func() {
 			time.Sleep(timeout)
 			if !handle.done {
+				d.logger.Warn("timeout reached, force-killing task", "task_id", taskID)
 				handle.shutdown()
 			}
 		}()
@@ -417,6 +547,8 @@ func (d *OCIDriver) StopTask(taskID string, timeout time.Duration, signal string
 }
 
 func (d *OCIDriver) DestroyTask(taskID string, force bool) error {
+	d.logger.Debug("DestroyTask called", "task_id", taskID, "force", force)
+
 	d.tasksLock.Lock()
 	handle, ok := d.tasks[taskID]
 	if ok {
@@ -425,19 +557,34 @@ func (d *OCIDriver) DestroyTask(taskID string, force bool) error {
 	d.tasksLock.Unlock()
 
 	if !ok {
+		d.logger.Debug("DestroyTask: no handle found for task, nothing to do", "task_id", taskID)
 		return nil
 	}
 
 	if !handle.done {
+		d.logger.Info("shutting down task process", "task_id", taskID, "pid", handle.proc.Pid)
 		handle.shutdown()
+	} else {
+		d.logger.Debug("task already finished, skipping shutdown", "task_id", taskID)
 	}
 
 	if handle.containerName != "" {
-		d.logger.Info("cleaning up buildah container", "container", handle.containerName)
+		d.logger.Info("cleaning up image container",
+			"task_id", taskID,
+			"container_id", handle.containerName,
+			"mountpoint", handle.mountPoint,
+		)
 		ctx, cancel := context.WithTimeout(d.ctx, 30*time.Second)
 		defer cancel()
-		d.backend.Unmount(ctx, handle.containerName)
-		d.backend.Remove(ctx, handle.containerName)
+		if err := d.backend.Unmount(ctx, handle.containerName); err != nil {
+			d.logger.Warn("unmount failed during cleanup", "container_id", handle.containerName, "error", err)
+		}
+		if err := d.backend.Remove(ctx, handle.containerName); err != nil {
+			d.logger.Warn("remove failed during cleanup", "container_id", handle.containerName, "error", err)
+		}
+		d.logger.Info("container cleaned up", "container_id", handle.containerName)
+	} else {
+		d.logger.Debug("no container to clean up", "task_id", taskID)
 	}
 
 	return nil
@@ -549,30 +696,43 @@ func (d *OCIDriver) TaskEvents(ctx context.Context) (<-chan *drivers.TaskEvent, 
 }
 
 func (d *OCIDriver) SignalTask(taskID string, signal string) error {
+	d.logger.Warn("SignalTask called but is not supported", "task_id", taskID, "signal", signal)
 	return fmt.Errorf("SignalTask is not supported by this driver")
 }
 
 func (d *OCIDriver) ExecTask(taskID string, cmd []string, timeout time.Duration) (*drivers.ExecTaskResult, error) {
+	d.logger.Warn("ExecTask called but is not supported", "task_id", taskID, "cmd", cmd)
 	return nil, fmt.Errorf("ExecTask is not supported by this driver")
 }
 
 func (d *OCIDriver) Shutdown() error {
+	d.logger.Info("Shutdown called — stopping all tasks and cleaning up")
 	d.cancel()
 
 	d.tasksLock.Lock()
 	defer d.tasksLock.Unlock()
 
-	for _, handle := range d.tasks {
+	taskCount := len(d.tasks)
+	d.logger.Info("shutting down running tasks", "count", taskCount)
+
+	for id, handle := range d.tasks {
+		d.logger.Debug("shutting down task", "task_id", id, "pid", handle.proc.Pid)
 		if !handle.done {
 			handle.shutdown()
 		}
 		if handle.containerName != "" {
+			d.logger.Debug("cleaning up container", "task_id", id, "container_id", handle.containerName)
 			ctx, cancel := context.WithTimeout(d.ctx, 30*time.Second)
 			defer cancel()
-			d.backend.Unmount(ctx, handle.containerName)
-			d.backend.Remove(ctx, handle.containerName)
+			if err := d.backend.Unmount(ctx, handle.containerName); err != nil {
+				d.logger.Warn("unmount failed during shutdown", "container_id", handle.containerName, "error", err)
+			}
+			if err := d.backend.Remove(ctx, handle.containerName); err != nil {
+				d.logger.Warn("remove failed during shutdown", "container_id", handle.containerName, "error", err)
+			}
 		}
 	}
 
+	d.logger.Info("shutdown complete")
 	return nil
 }
