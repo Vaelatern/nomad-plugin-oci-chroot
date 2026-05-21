@@ -55,7 +55,7 @@ func (b *embeddedBuildahBackend) Pull(ctx context.Context, image string, force b
 	ref, err := name.ParseReference(image)
 	if err != nil {
 		errLog.Printf("pull: failed to parse image reference %s: %v", image, err)
-		return fmt.Errorf("parse reference %s: %w", image, err)
+		return fmt.Errorf("invalid image reference %q: %w", image, err)
 	}
 	errLog.Printf("pull: reference parsed: %s", ref.String())
 
@@ -64,7 +64,7 @@ func (b *embeddedBuildahBackend) Pull(ctx context.Context, image string, force b
 	desc, err := remote.Get(ref)
 	if err != nil {
 		errLog.Printf("pull: failed to fetch %s: %v", image, err)
-		return fmt.Errorf("pull %s: %w", image, err)
+		return fmt.Errorf("pull image %q from %s: %w", image, ref.Context().RegistryStr(), err)
 	}
 	errLog.Printf("pull: image accessible — digest: %s, media type: %s", desc.Digest.String(), desc.MediaType)
 	return nil

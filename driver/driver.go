@@ -241,6 +241,7 @@ func (d *OCIDriver) StartTask(cfg *drivers.TaskConfig) (*drivers.TaskHandle, *dr
 
 	image := taskConfig.Image
 
+	d.emitEvent(cfg, "Downloading image: "+image)
 	d.logger.Info("starting image pull",
 		"image", image,
 		"force_pull", taskConfig.ForcePull,
@@ -249,10 +250,12 @@ func (d *OCIDriver) StartTask(cfg *drivers.TaskConfig) (*drivers.TaskHandle, *dr
 	pullCtx, pullCancel := context.WithTimeout(d.ctx, buildahTimeout)
 	defer pullCancel()
 	if err := d.backend.Pull(pullCtx, image, taskConfig.ForcePull); err != nil {
+		d.emitEvent(cfg, fmt.Sprintf("Failed to download image %s: %v", image, err))
 		errMsg := fmt.Errorf("failed to pull image %s: %v", image, err)
 		d.logger.Error("image pull failed", "image", image, "error", err)
 		return nil, nil, errMsg
 	}
+	d.emitEvent(cfg, "Image downloaded: "+image)
 	d.logger.Info("image pull succeeded", "image", image)
 
 	useDefaultCommand := taskConfig.Command == ""
@@ -334,30 +337,37 @@ func (d *OCIDriver) StartTask(cfg *drivers.TaskConfig) (*drivers.TaskHandle, *dr
 
 	fromCtx, fromCancel := context.WithTimeout(d.ctx, buildahTimeout)
 	defer fromCancel()
+	d.emitEvent(cfg, "Extracting image layers: "+image)
 	d.logger.Info("extracting image layers to chroot directory", "image", image, "timeout", buildahTimeout)
 	containerName, err := d.backend.From(fromCtx, image)
 	if err != nil {
+		d.emitEvent(cfg, fmt.Sprintf("Failed to extract image %s: %v", image, err))
 		errMsg := fmt.Errorf("failed to extract image %s: %v", image, err)
 		d.logger.Error("image extraction failed", "image", image, "error", err)
 		return nil, nil, errMsg
 	}
+	d.emitEvent(cfg, "Image extracted: "+containerName)
 	d.logger.Info("image extracted", "container_id", containerName, "image", image)
 
 	mountCtx, mountCancel := context.WithTimeout(d.ctx, 30*time.Second)
 	defer mountCancel()
+	d.emitEvent(cfg, "Mounting image rootfs")
 	d.logger.Debug("mounting container rootfs", "container_id", containerName)
 	mountPoint, err := d.backend.Mount(mountCtx, containerName)
 	if err != nil {
+		d.emitEvent(cfg, fmt.Sprintf("Failed to mount image rootfs: %v", err))
 		d.logger.Error("mount failed, cleaning up container", "container_id", containerName, "error", err)
 		rmCtx, rmCancel := context.WithTimeout(d.ctx, 30*time.Second)
 		defer rmCancel()
 		d.backend.Remove(rmCtx, containerName)
 		return nil, nil, fmt.Errorf("failed to mount container %s: %v", containerName, err)
 	}
+	d.emitEvent(cfg, "Image rootfs mounted")
 	d.logger.Info("chroot rootfs ready", "mountpoint", mountPoint, "container_id", containerName)
 
 	selfExe, err := os.Executable()
 	if err != nil {
+		d.emitEvent(cfg, fmt.Sprintf("Failed to find own executable: %v", err))
 		d.logger.Error("cannot determine own executable path", "error", err)
 		cleanupCtx, cleanupCancel := context.WithTimeout(d.ctx, 30*time.Second)
 		defer cleanupCancel()
@@ -425,12 +435,14 @@ func (d *OCIDriver) StartTask(cfg *drivers.TaskConfig) (*drivers.TaskHandle, *dr
 
 	stdoutW, err := os.OpenFile(cfg.StdoutPath, os.O_WRONLY, 0)
 	if err != nil {
+		d.emitEvent(cfg, fmt.Sprintf("Failed to open stdout: %v", err))
 		d.logger.Error("failed to open stdout FIFO", "path", cfg.StdoutPath, "error", err)
 		cleanup()
 		return nil, nil, fmt.Errorf("failed to open stdout FIFO: %v", err)
 	}
 	stderrW, err := os.OpenFile(cfg.StderrPath, os.O_WRONLY, 0)
 	if err != nil {
+		d.emitEvent(cfg, fmt.Sprintf("Failed to open stderr: %v", err))
 		d.logger.Error("failed to open stderr FIFO", "path", cfg.StderrPath, "error", err)
 		stdoutW.Close()
 		cleanup()
@@ -447,6 +459,7 @@ func (d *OCIDriver) StartTask(cfg *drivers.TaskConfig) (*drivers.TaskHandle, *dr
 	cmd.Stderr = stderrW
 	cmd.Stdin = nil
 
+	d.emitEvent(cfg, "Starting chroot task")
 	d.logger.Info("spawning chroot process",
 		"pid", "pending",
 		"command", taskConfig.Command,
@@ -456,6 +469,7 @@ func (d *OCIDriver) StartTask(cfg *drivers.TaskConfig) (*drivers.TaskHandle, *dr
 	)
 
 	if err := cmd.Start(); err != nil {
+		d.emitEvent(cfg, fmt.Sprintf("Failed to spawn chroot process: %v", err))
 		d.logger.Error("failed to spawn chroot process", "error", err)
 		stdoutW.Close()
 		stderrW.Close()
@@ -491,13 +505,7 @@ func (d *OCIDriver) StartTask(cfg *drivers.TaskConfig) (*drivers.TaskHandle, *dr
 
 	d.tasks[cfg.ID] = handle
 
-	d.taskEvents <- &drivers.TaskEvent{
-		TaskID:    cfg.ID,
-		TaskName:  cfg.Name,
-		AllocID:   cfg.AllocID,
-		Timestamp: time.Now(),
-		Message:   "task started",
-	}
+	d.emitEvent(cfg, "Task started — running "+taskConfig.Command)
 
 	taskHandle := handle.toHandle()
 	return taskHandle, nil, nil
@@ -705,6 +713,21 @@ func (d *OCIDriver) getResourceUsage(pid int) *cstructs.TaskResourceUsage {
 
 func (d *OCIDriver) TaskEvents(ctx context.Context) (<-chan *drivers.TaskEvent, error) {
 	return d.taskEvents, nil
+}
+
+func (d *OCIDriver) emitEvent(cfg *drivers.TaskConfig, message string) {
+	event := &drivers.TaskEvent{
+		TaskID:    cfg.ID,
+		TaskName:  cfg.Name,
+		AllocID:   cfg.AllocID,
+		Timestamp: time.Now(),
+		Message:   message,
+	}
+	select {
+	case d.taskEvents <- event:
+	default:
+		d.logger.Warn("task event channel full, dropping event", "message", message)
+	}
 }
 
 func (d *OCIDriver) SignalTask(taskID string, signal string) error {
