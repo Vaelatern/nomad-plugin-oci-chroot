@@ -60,6 +60,7 @@ func (b *cliBuildahBackend) Inspect(ctx context.Context, image string) (*ImageCo
 			Config struct {
 				Entrypoint []string `json:"Entrypoint"`
 				Cmd        []string `json:"Cmd"`
+				WorkDir    string   `json:"WorkingDir"`
 			} `json:"config"`
 		} `json:"OCIv1"`
 	}
@@ -69,6 +70,7 @@ func (b *cliBuildahBackend) Inspect(ctx context.Context, image string) (*ImageCo
 	return &ImageConfig{
 		Entrypoint: result.OCIv1.Config.Entrypoint,
 		Cmd:        result.OCIv1.Config.Cmd,
+		WorkDir:    result.OCIv1.Config.WorkDir,
 	}, nil
 }
 

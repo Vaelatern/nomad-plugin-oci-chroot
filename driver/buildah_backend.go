@@ -5,6 +5,7 @@ import "context"
 type ImageConfig struct {
 	Entrypoint []string
 	Cmd        []string
+	WorkDir    string
 }
 
 type BuildahBackend interface {

@@ -242,6 +242,21 @@ func chrootExec() {
 		}
 	}
 
+	// Change to WORKDIR if set
+	workDir := os.Getenv("_OCI_CHROOT_WORKDIR")
+	if workDir != "" {
+		fmt.Fprintf(os.Stderr, "[oci-chroot] changing to workdir: %s\n", workDir)
+		if _, err := os.Stat(workDir); err != nil {
+			fmt.Fprintf(os.Stderr, "[oci-chroot] WARN: workdir %s does not exist: %v\n", workDir, err)
+		} else if err := os.Chdir(workDir); err != nil {
+			fmt.Fprintf(os.Stderr, "[oci-chroot] WARN: chdir to workdir %s failed: %v\n", workDir, err)
+		} else {
+			fmt.Fprintf(os.Stderr, "[oci-chroot] working directory is now: %s\n", workDir)
+		}
+	} else {
+		fmt.Fprintf(os.Stderr, "[oci-chroot] no WORKDIR set, staying at /\n")
+	}
+
 	cmd := os.Getenv("_OCI_CHROOT_COMMAND")
 	argsB64 := os.Getenv("_OCI_CHROOT_ARGS")
 	var args []string

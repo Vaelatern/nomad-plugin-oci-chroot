@@ -234,6 +234,7 @@ func (d *OCIDriver) StartTask(cfg *drivers.TaskConfig) (*drivers.TaskHandle, *dr
 		"image", taskConfig.Image,
 		"command", taskConfig.Command,
 		"args", taskConfig.Args,
+		"work_dir", taskConfig.WorkDir,
 		"bind_sockets", taskConfig.BindSockets,
 		"force_pull", taskConfig.ForcePull,
 	)
@@ -256,18 +257,20 @@ func (d *OCIDriver) StartTask(cfg *drivers.TaskConfig) (*drivers.TaskHandle, *dr
 
 	useDefaultCommand := taskConfig.Command == ""
 	useDefaultArgs := len(taskConfig.Args) == 0
+	useDefaultWorkDir := taskConfig.WorkDir == ""
 
-	if useDefaultCommand || useDefaultArgs {
-		d.logger.Debug("inspecting image for Entrypoint/Cmd defaults",
+	if useDefaultCommand || useDefaultArgs || useDefaultWorkDir {
+		d.logger.Debug("inspecting image for Entrypoint/Cmd/WorkDir defaults",
 			"image", image,
 			"use_default_command", useDefaultCommand,
 			"use_default_args", useDefaultArgs,
+			"use_default_work_dir", useDefaultWorkDir,
 		)
 		inspectCtx, inspectCancel := context.WithTimeout(d.ctx, 30*time.Second)
 		defer inspectCancel()
 		imgConfig, err := d.backend.Inspect(inspectCtx, image)
 		if err != nil {
-			d.logger.Warn("failed to inspect image metadata — falling back to hardcoded /bin/sh",
+			d.logger.Warn("failed to inspect image metadata — falling back to hardcoded defaults",
 				"image", image, "error", err,
 			)
 		} else {
@@ -275,6 +278,7 @@ func (d *OCIDriver) StartTask(cfg *drivers.TaskConfig) (*drivers.TaskHandle, *dr
 				"image", image,
 				"entrypoint", imgConfig.Entrypoint,
 				"cmd", imgConfig.Cmd,
+				"work_dir", imgConfig.WorkDir,
 			)
 
 			if useDefaultCommand {
@@ -307,6 +311,11 @@ func (d *OCIDriver) StartTask(cfg *drivers.TaskConfig) (*drivers.TaskHandle, *dr
 					"cmd", imgConfig.Cmd,
 				)
 			}
+
+			if useDefaultWorkDir && imgConfig.WorkDir != "" {
+				taskConfig.WorkDir = imgConfig.WorkDir
+				d.logger.Debug("using image WORKDIR", "work_dir", taskConfig.WorkDir)
+			}
 		}
 
 		if taskConfig.Command == "" {
@@ -319,7 +328,8 @@ func (d *OCIDriver) StartTask(cfg *drivers.TaskConfig) (*drivers.TaskHandle, *dr
 		"image", image,
 		"command", taskConfig.Command,
 		"args", taskConfig.Args,
-		"from_image_defaults", useDefaultCommand || useDefaultArgs,
+		"work_dir", taskConfig.WorkDir,
+		"from_image_defaults", useDefaultCommand || useDefaultArgs || useDefaultWorkDir,
 	)
 
 	fromCtx, fromCancel := context.WithTimeout(d.ctx, buildahTimeout)
@@ -394,6 +404,7 @@ func (d *OCIDriver) StartTask(cfg *drivers.TaskConfig) (*drivers.TaskHandle, *dr
 		"_OCI_CHROOT_MOUNTPOINT="+mountPoint,
 		"_OCI_CHROOT_COMMAND="+taskConfig.Command,
 		"_OCI_CHROOT_ARGS="+argsB64,
+		"_OCI_CHROOT_WORKDIR="+taskConfig.WorkDir,
 		"_OCI_CHROOT_BIND_SOCKETS="+socketsB64,
 		"_OCI_CHROOT_DIRS="+dirsB64,
 	)
@@ -401,6 +412,7 @@ func (d *OCIDriver) StartTask(cfg *drivers.TaskConfig) (*drivers.TaskHandle, *dr
 		"env_count", len(env),
 		"alloc_id", cfg.AllocID,
 		"task_name", cfg.Name,
+		"work_dir", taskConfig.WorkDir,
 	)
 
 	cleanup := func() {

@@ -93,6 +93,7 @@ job "example" {
         image        = "alpine:latest"
         command      = "/bin/sh"
         args         = ["-c", "echo hello"]
+        work_dir     = "/app"              # optional, overrides image WORKDIR
         bind_sockets = []                  # optional, host sockets to mount
         force_pull   = false               # optional, always re-pull image
       }
@@ -108,13 +109,14 @@ job "example" {
 
 ### Task config options
 
-| Option         | Type           | Required | Description                                |
-|----------------|----------------|----------|--------------------------------------------|
-| `image`        | `string`       | yes      | OCI container image reference              |
-| `command`      | `string`       | no       | Command to run (default `/bin/sh`)         |
-| `args`         | `list(string)` | no       | Arguments to the command                   |
-| `bind_sockets` | `list(string)` | no       | Host Unix socket paths to bind-mount inside |
-| `force_pull`   | `bool`         | no       | Always re-pull the image on each run       |
+| Option         | Type           | Required | Description                                                  |
+|----------------|----------------|----------|--------------------------------------------------------------|
+| `image`        | `string`       | yes      | OCI container image reference                                |
+| `command`      | `string`       | no       | Command to run (default from image ENTRYPOINT/CMD, else `/bin/sh`) |
+| `args`         | `list(string)` | no       | Arguments to the command (default from image CMD)            |
+| `work_dir`     | `string`       | no       | Working directory inside the chroot (default from image WORKDIR) |
+| `bind_sockets` | `list(string)` | no       | Host Unix socket paths to bind-mount inside                  |
+| `force_pull`   | `bool`         | no       | Always re-pull the image on each run                         |
 
 ## Image backends
 

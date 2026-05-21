@@ -149,10 +149,11 @@ func (b *embeddedBuildahBackend) Inspect(ctx context.Context, image string) (*Im
 		errLog.Printf("inspect: failed to read config file for %s: %v", image, err)
 		return nil, fmt.Errorf("config file %s: %w", image, err)
 	}
-	errLog.Printf("inspect: entrypoint=%v cmd=%v", cf.Config.Entrypoint, cf.Config.Cmd)
+	errLog.Printf("inspect: entrypoint=%v cmd=%v work_dir=%s", cf.Config.Entrypoint, cf.Config.Cmd, cf.Config.WorkingDir)
 	return &ImageConfig{
 		Entrypoint: cf.Config.Entrypoint,
 		Cmd:        cf.Config.Cmd,
+		WorkDir:    cf.Config.WorkingDir,
 	}, nil
 }
 
