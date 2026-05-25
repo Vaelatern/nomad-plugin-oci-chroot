@@ -3,12 +3,15 @@ PLUGIN_DIR=nomad-plugin-dev
 
 .PHONY: build install clean
 
-build:
+build: $(BINARY)
+
+$(BINARY):
 	go build -o $(BINARY) .
 
 install: build
-	mkdir -p $(PLUGIN_DIR)
-	cp $(BINARY) $(PLUGIN_DIR)/$(BINARY)
+	sudo rm -f /opt/nomad/plugins/$(BINARY)
+	sudo cp $(BINARY) /opt/nomad/plugins/$(BINARY)
+	sudo sv restart nomad
 
 clean:
 	rm -f $(BINARY) nomad-plugin-dev/*

@@ -34,7 +34,7 @@ func (b *cliBuildahBackend) Pull(ctx context.Context, image string, force bool) 
 	return buildahRunContext(ctx, "pull", image)
 }
 
-func (b *cliBuildahBackend) From(ctx context.Context, image string) (string, error) {
+func (b *cliBuildahBackend) From(ctx context.Context, image string, _ string) (string, error) {
 	return buildahOutputContext(ctx, "from", image)
 }
 

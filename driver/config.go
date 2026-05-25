@@ -27,4 +27,5 @@ type OciChrootTaskState struct {
 	MountPoint    string `codec:"mount_point"`
 	PID           int    `codec:"pid"`
 	ImageRef      string `codec:"image_ref"`
+	NetnsPath     string `codec:"netns_path"`
 }

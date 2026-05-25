@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -21,9 +22,29 @@ import (
 	"github.com/hashicorp/nomad/plugins/drivers/fsisolation"
 	"github.com/hashicorp/nomad/plugins/shared/hclspec"
 	pstructs "github.com/hashicorp/nomad/plugins/shared/structs"
+	"golang.org/x/sys/unix"
 )
 
 const pluginVersion = "0.1.0"
+
+func signalFromString(name string) (os.Signal, error) {
+	if name == "" {
+		return syscall.SIGTERM, nil
+	}
+	// Accept both "SIGTERM" and "TERM" forms
+	sigName := name
+	if !strings.HasPrefix(name, "SIG") {
+		sigName = "SIG" + name
+	}
+	if s := unix.SignalNum(sigName); s != 0 {
+		return s, nil
+	}
+	// Try numeric
+	if n, err := strconv.Atoi(name); err == nil {
+		return syscall.Signal(n), nil
+	}
+	return nil, fmt.Errorf("unknown or unsupported signal: %q", name)
+}
 
 type OCIDriver struct {
 	pluginName string
@@ -40,7 +61,7 @@ type OCIDriver struct {
 }
 
 type Config struct {
-	Enabled    bool `codec:"enabled"`
+	Enabled     bool `codec:"enabled"`
 	HostBuildah bool `codec:"host_buildah"`
 }
 
@@ -130,11 +151,14 @@ func (d *OCIDriver) TaskConfigSchema() (*hclspec.Spec, error) {
 
 func (d *OCIDriver) Capabilities() (*drivers.Capabilities, error) {
 	return &drivers.Capabilities{
-		SendSignals: false,
-		Exec:        false,
+		SendSignals: true,
+		Exec:        true,
 		FSIsolation: fsisolation.Chroot,
 		NetIsolationModes: []drivers.NetIsolationMode{
+			drivers.NetIsolationModeNone,
 			drivers.NetIsolationModeHost,
+			drivers.NetIsolationModeGroup,
+			drivers.NetIsolationModeTask,
 		},
 		MountConfigs: drivers.MountConfigSupportNone,
 	}, nil
@@ -160,10 +184,10 @@ func (d *OCIDriver) Fingerprint(ctx context.Context) (<-chan *drivers.Fingerprin
 				buildahVer, _ := d.backend.Version()
 				attrKey := "driver." + d.pluginName
 				attrs = map[string]*pstructs.Attribute{
-					attrKey:                        pstructs.NewStringAttribute("1"),
-					attrKey + ".version":           pstructs.NewStringAttribute(pluginVersion),
-					attrKey + ".buildah":           pstructs.NewStringAttribute(buildahVer),
-					attrKey + ".buildah_backend":   pstructs.NewStringAttribute(d.backend.Name()),
+					attrKey:                      pstructs.NewStringAttribute("1"),
+					attrKey + ".version":         pstructs.NewStringAttribute(pluginVersion),
+					attrKey + ".buildah":         pstructs.NewStringAttribute(buildahVer),
+					attrKey + ".buildah_backend": pstructs.NewStringAttribute(d.backend.Name()),
 				}
 
 				if ok, failDesc := d.backend.Available(); !ok {
@@ -335,11 +359,14 @@ func (d *OCIDriver) StartTask(cfg *drivers.TaskConfig) (*drivers.TaskHandle, *dr
 		"from_image_defaults", useDefaultCommand || useDefaultArgs || useDefaultWorkDir,
 	)
 
+	// Create per-task extraction directory inside the allocation directory
+	rootfsDir := filepath.Join(cfg.AllocDir, cfg.Name, "rootfs")
+	d.logger.Info("extracting image layers to per-allocation rootfs", "image", image, "rootfs", rootfsDir)
+
 	fromCtx, fromCancel := context.WithTimeout(d.ctx, buildahTimeout)
 	defer fromCancel()
 	d.emitEvent(cfg, "Extracting image layers: "+image)
-	d.logger.Info("extracting image layers to chroot directory", "image", image, "timeout", buildahTimeout)
-	containerName, err := d.backend.From(fromCtx, image)
+	containerName, err := d.backend.From(fromCtx, image, rootfsDir)
 	if err != nil {
 		d.emitEvent(cfg, fmt.Sprintf("Failed to extract image %s: %v", image, err))
 		errMsg := fmt.Errorf("failed to extract image %s: %v", image, err)
@@ -409,6 +436,17 @@ func (d *OCIDriver) StartTask(cfg *drivers.TaskConfig) (*drivers.TaskHandle, *dr
 	}
 
 	env := cfg.EnvList()
+
+	// Network isolation: if Nomad provides a network namespace (bridge/group mode),
+	// pass the path so the chroot process enters it via setns(CLONE_NEWNET)
+	netnsPath := ""
+	if cfg.NetworkIsolation != nil && cfg.NetworkIsolation.Path != "" {
+		netnsPath = cfg.NetworkIsolation.Path
+		d.logger.Info("task uses network namespace", "netns_path", netnsPath, "mode", cfg.NetworkIsolation.Mode)
+	} else {
+		d.logger.Debug("no network namespace for this task")
+	}
+
 	env = append(env,
 		"_OCI_CHROOT_EXEC=1",
 		"_OCI_CHROOT_MOUNTPOINT="+mountPoint,
@@ -417,6 +455,7 @@ func (d *OCIDriver) StartTask(cfg *drivers.TaskConfig) (*drivers.TaskHandle, *dr
 		"_OCI_CHROOT_WORKDIR="+taskConfig.WorkDir,
 		"_OCI_CHROOT_BIND_SOCKETS="+socketsB64,
 		"_OCI_CHROOT_DIRS="+dirsB64,
+		"_OCI_CHROOT_NETNS="+netnsPath,
 	)
 	d.logger.Debug("task environment prepared",
 		"env_count", len(env),
@@ -496,6 +535,7 @@ func (d *OCIDriver) StartTask(cfg *drivers.TaskConfig) (*drivers.TaskHandle, *dr
 		containerName: containerName,
 		mountPoint:    mountPoint,
 		imageRef:      image,
+		netnsPath:     netnsPath,
 		logger:        d.logger,
 		ch:            make(chan *drivers.ExitResult, 1),
 		doneCh:        make(chan struct{}),
@@ -540,14 +580,10 @@ func (d *OCIDriver) StopTask(taskID string, timeout time.Duration, signal string
 		return nil
 	}
 
-	sig := os.Signal(syscall.SIGTERM)
-	if signal != "" {
-		switch signal {
-		case "SIGKILL":
-			sig = syscall.SIGKILL
-		case "SIGINT":
-			sig = syscall.SIGINT
-		}
+	sig, err := signalFromString(signal)
+	if err != nil {
+		d.logger.Warn("invalid signal, falling back to SIGTERM", "signal", signal, "error", err)
+		sig = syscall.SIGTERM
 	}
 
 	d.logger.Info("sending signal to task", "task_id", taskID, "signal", sig, "pid", handle.proc.Pid)
@@ -731,13 +767,189 @@ func (d *OCIDriver) emitEvent(cfg *drivers.TaskConfig, message string) {
 }
 
 func (d *OCIDriver) SignalTask(taskID string, signal string) error {
-	d.logger.Warn("SignalTask called but is not supported", "task_id", taskID, "signal", signal)
-	return fmt.Errorf("SignalTask is not supported by this driver")
+	d.logger.Debug("SignalTask called", "task_id", taskID, "signal", signal)
+
+	d.tasksLock.Lock()
+	handle, ok := d.tasks[taskID]
+	d.tasksLock.Unlock()
+
+	if !ok {
+		d.logger.Warn("SignalTask: task not found", "task_id", taskID)
+		return fmt.Errorf("task not found: %s", taskID)
+	}
+
+	if handle.done {
+		d.logger.Debug("SignalTask: task already finished", "task_id", taskID)
+		return nil
+	}
+
+	sig, err := signalFromString(signal)
+	if err != nil {
+		d.logger.Error("SignalTask: invalid signal", "signal", signal, "error", err)
+		return fmt.Errorf("invalid signal %q: %v", signal, err)
+	}
+
+	d.logger.Info("sending signal to task", "task_id", taskID, "signal", sig, "pid", handle.proc.Pid)
+	if err := handle.proc.Signal(sig); err != nil {
+		d.logger.Error("SignalTask: failed to send signal", "task_id", taskID, "signal", sig, "error", err)
+		return fmt.Errorf("failed to send signal %s to task %s: %v", signal, taskID, err)
+	}
+
+	return nil
 }
 
 func (d *OCIDriver) ExecTask(taskID string, cmd []string, timeout time.Duration) (*drivers.ExecTaskResult, error) {
-	d.logger.Warn("ExecTask called but is not supported", "task_id", taskID, "cmd", cmd)
-	return nil, fmt.Errorf("ExecTask is not supported by this driver")
+	d.logger.Debug("ExecTask called", "task_id", taskID, "cmd", cmd, "timeout", timeout)
+
+	d.tasksLock.Lock()
+	handle, ok := d.tasks[taskID]
+	d.tasksLock.Unlock()
+
+	if !ok {
+		d.logger.Warn("ExecTask: task not found", "task_id", taskID)
+		return nil, fmt.Errorf("task not found: %s", taskID)
+	}
+
+	if handle.done {
+		d.logger.Warn("ExecTask: task already finished", "task_id", taskID)
+		return nil, fmt.Errorf("task %s is not running", taskID)
+	}
+
+	if len(cmd) == 0 || cmd[0] == "" {
+		return nil, fmt.Errorf("exec command must not be empty")
+	}
+
+	// Resolve mount point: prefer handle, fall back to env
+	mountPoint := handle.mountPoint
+	if mountPoint == "" {
+		d.logger.Error("ExecTask: mount point unknown for task", "task_id", taskID)
+		return nil, fmt.Errorf("mount point unknown for task %s", taskID)
+	}
+
+	// Serialize args (everything after cmd[0])
+	var execArgs []string
+	if len(cmd) > 1 {
+		execArgs = cmd[1:]
+	}
+	argsJSON, err := json.Marshal(execArgs)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal exec args: %v", err)
+	}
+	argsB64 := base64.StdEncoding.EncodeToString(argsJSON)
+
+	selfExe, err := os.Executable()
+	if err != nil {
+		return nil, fmt.Errorf("cannot find own executable: %v", err)
+	}
+
+	// Build environment for the exec process
+	env := handle.taskConfig.EnvList()
+	env = append(env,
+		"_OCI_CHROOT_EXEC=1",
+		"_OCI_CHROOT_MOUNTPOINT="+mountPoint,
+		"_OCI_CHROOT_COMMAND="+cmd[0],
+		"_OCI_CHROOT_ARGS="+argsB64,
+		"_OCI_CHROOT_WORKDIR=",
+	)
+
+	// Enter same network namespace if the task uses one
+	if handle.netnsPath != "" {
+		env = append(env, "_OCI_CHROOT_NETNS="+handle.netnsPath)
+	}
+
+	// Don't bind-mount sockets/dirs for exec — the rootfs is already set up
+	env = append(env,
+		"_OCI_CHROOT_BIND_SOCKETS=",
+		"_OCI_CHROOT_DIRS=",
+	)
+
+	d.logger.Debug("ExecTask: spawning chroot executor",
+		"command", cmd[0],
+		"args", execArgs,
+		"mountpoint", mountPoint,
+		"netns", handle.netnsPath,
+	)
+
+	// Create pipes for stdout and stderr
+	stdoutR, stdoutW, err := os.Pipe()
+	if err != nil {
+		return nil, fmt.Errorf("failed to create stdout pipe: %v", err)
+	}
+	defer stdoutR.Close()
+
+	stderrR, stderrW, err := os.Pipe()
+	if err != nil {
+		stdoutW.Close()
+		return nil, fmt.Errorf("failed to create stderr pipe: %v", err)
+	}
+	defer stderrR.Close()
+
+	// Spawn the chroot executor process
+	execCmd := exec.Command(selfExe)
+	execCmd.Env = env
+	execCmd.Stdout = stdoutW
+	execCmd.Stderr = stderrW
+	execCmd.Stdin = nil
+
+	if err := execCmd.Start(); err != nil {
+		stdoutW.Close()
+		stderrW.Close()
+		return nil, fmt.Errorf("failed to spawn exec process: %v", err)
+	}
+	stdoutW.Close()
+	stderrW.Close()
+
+	// Read output with timeout
+	var stdout, stderr []byte
+	var waitErr error
+	done := make(chan struct{})
+	go func() {
+		stdout, _ = io.ReadAll(stdoutR)
+		stderr, _ = io.ReadAll(stderrR)
+		waitErr = execCmd.Wait()
+		close(done)
+	}()
+
+	if timeout > 0 {
+		select {
+		case <-done:
+		case <-time.After(timeout):
+			execCmd.Process.Kill()
+			<-done
+		}
+	} else {
+		<-done
+	}
+
+	exitCode := 0
+	var signal int32
+	if waitErr != nil {
+		if exitErr, ok := waitErr.(*exec.ExitError); ok {
+			exitCode = exitErr.ExitCode()
+			if ws, ok := exitErr.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
+				signal = int32(ws.Signal())
+			}
+		} else {
+			// Process was killed or other error
+			exitCode = -1
+		}
+	}
+
+	d.logger.Debug("ExecTask: completed",
+		"exit_code", exitCode,
+		"signal", signal,
+		"stdout_len", len(stdout),
+		"stderr_len", len(stderr),
+	)
+
+	return &drivers.ExecTaskResult{
+		Stdout: stdout,
+		Stderr: stderr,
+		ExitResult: &drivers.ExitResult{
+			ExitCode: exitCode,
+			Signal:   int(signal),
+		},
+	}, nil
 }
 
 func (d *OCIDriver) Shutdown() error {

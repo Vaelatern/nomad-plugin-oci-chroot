@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/google/go-containerregistry/pkg/name"
 	"github.com/google/go-containerregistry/pkg/v1/mutate"
@@ -70,7 +71,7 @@ func (b *embeddedBuildahBackend) Pull(ctx context.Context, image string, force b
 	return nil
 }
 
-func (b *embeddedBuildahBackend) From(ctx context.Context, image string) (string, error) {
+func (b *embeddedBuildahBackend) From(ctx context.Context, image string, dest string) (string, error) {
 	errLog.Printf("from: parsing image reference: %s", image)
 	ref, err := name.ParseReference(image)
 	if err != nil {
@@ -87,34 +88,17 @@ func (b *embeddedBuildahBackend) From(ctx context.Context, image string) (string
 	}
 	errLog.Printf("from: image metadata fetched")
 
-	// Get image digest for a unique container ID
-	digest, err := img.Digest()
-	if err != nil {
-		errLog.Printf("from: failed to get image digest: %v", err)
-		return "", fmt.Errorf("get digest: %w", err)
+	rootfs := dest
+	if rootfs == "" {
+		rootfs = filepath.Join(b.storageDir, fmt.Sprintf("%d", time.Now().UnixNano()))
 	}
-	containerID := digest.Hex[:16]
-	errLog.Printf("from: image digest computed, container ID: %s", containerID)
-
-	rootfs := filepath.Join(b.storageDir, containerID)
 	errLog.Printf("from: rootfs path: %s", rootfs)
-
-	// Skip extraction if already exists
-	if _, err := os.Stat(rootfs); err == nil {
-		errLog.Printf("from: rootfs already extracted, reusing cached copy at %s", rootfs)
-		b.mu.Lock()
-		b.roots[containerID] = rootfs
-		b.mu.Unlock()
-		return containerID, nil
-	}
-	errLog.Printf("from: rootfs not cached, extracting layers...")
 
 	if err := os.MkdirAll(rootfs, 0755); err != nil {
 		errLog.Printf("from: failed to create rootfs directory %s: %v", rootfs, err)
 		return "", fmt.Errorf("mkdir rootfs: %w", err)
 	}
 
-	// Extract image layers to rootfs directory
 	errLog.Printf("from: starting layer extraction to %s", rootfs)
 	rc := mutate.Extract(img)
 	if err := extractTarStream(rc, rootfs); err != nil {
@@ -124,6 +108,7 @@ func (b *embeddedBuildahBackend) From(ctx context.Context, image string) (string
 	}
 	errLog.Printf("from: layer extraction complete")
 
+	containerID := filepath.Base(rootfs)
 	b.mu.Lock()
 	b.roots[containerID] = rootfs
 	b.mu.Unlock()

@@ -11,6 +11,7 @@ import (
 
 	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/nomad/plugins"
+	"golang.org/x/sys/unix"
 
 	"oci-chroot-driver/driver"
 )
@@ -66,6 +67,26 @@ func chrootExec() {
 		os.Exit(1)
 	}
 	fmt.Fprintf(os.Stderr, "[oci-chroot] mount point verified\n")
+
+	// Enter network namespace if requested (bridge/group network mode)
+	netnsPath := os.Getenv("_OCI_CHROOT_NETNS")
+	if netnsPath != "" {
+		fmt.Fprintf(os.Stderr, "[oci-chroot] joining network namespace: %s\n", netnsPath)
+		f, err := os.Open(netnsPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[oci-chroot] FATAL: cannot open netns %s: %v\n", netnsPath, err)
+			os.Exit(1)
+		}
+		if err := unix.Setns(int(f.Fd()), unix.CLONE_NEWNET); err != nil {
+			f.Close()
+			fmt.Fprintf(os.Stderr, "[oci-chroot] FATAL: setns(CLONE_NEWNET) failed for %s: %v\n", netnsPath, err)
+			os.Exit(1)
+		}
+		f.Close()
+		fmt.Fprintf(os.Stderr, "[oci-chroot] network namespace joined: %s\n", netnsPath)
+	} else {
+		fmt.Fprintf(os.Stderr, "[oci-chroot] no network namespace to join (host/group networking)\n")
+	}
 
 	// Check what's in the mount point
 	entries, _ := os.ReadDir(mountPoint)
@@ -213,13 +234,13 @@ func chrootExec() {
 		fmt.Fprintf(os.Stderr, "[oci-chroot] no host sockets to bind-mount\n")
 	}
 
-	// Bind-mount host resolv.conf
-	if _, err := os.Stat("/etc/resolv.conf"); err == nil {
-		fmt.Fprintf(os.Stderr, "[oci-chroot] bind-mounting /etc/resolv.conf\n")
+	// Copy host resolv.conf into chroot so DNS works inside the chroot
+	if data, err := os.ReadFile("/etc/resolv.conf"); err == nil {
+		fmt.Fprintf(os.Stderr, "[oci-chroot] copying /etc/resolv.conf into chroot\n")
 		dst := mp("/etc/resolv.conf")
-		os.WriteFile(dst, nil, 0644)
-		if err := syscall.Mount("/etc/resolv.conf", dst, "", syscall.MS_BIND, ""); err != nil {
-			fmt.Fprintf(os.Stderr, "[oci-chroot] WARN: bind mount resolv.conf failed: %v\n", err)
+		os.MkdirAll(filepath.Dir(dst), 0755)
+		if err := os.WriteFile(dst, data, 0644); err != nil {
+			fmt.Fprintf(os.Stderr, "[oci-chroot] WARN: failed to write resolv.conf into chroot: %v\n", err)
 		}
 	} else {
 		fmt.Fprintf(os.Stderr, "[oci-chroot] /etc/resolv.conf not found on host, skipping\n")

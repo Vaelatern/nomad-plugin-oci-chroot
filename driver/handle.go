@@ -21,6 +21,7 @@ type taskHandle struct {
 	containerName string
 	mountPoint    string
 	imageRef      string
+	netnsPath     string
 
 	logger hclog.Logger
 	ch     chan *drivers.ExitResult
@@ -106,6 +107,7 @@ func (h *taskHandle) toHandle() *drivers.TaskHandle {
 		MountPoint:    h.mountPoint,
 		PID:           h.proc.Pid,
 		ImageRef:      h.imageRef,
+		NetnsPath:     h.netnsPath,
 	}
 	handle := drivers.NewTaskHandle(1)
 	handle.Config = h.taskConfig
@@ -133,6 +135,7 @@ func buildHandleFromHandle(th *drivers.TaskHandle, logger hclog.Logger) (*taskHa
 		containerName: state.ContainerName,
 		mountPoint:    state.MountPoint,
 		imageRef:      state.ImageRef,
+		netnsPath:     state.NetnsPath,
 		startedAt:     time.Now(),
 		logger:        logger,
 		ch:            make(chan *drivers.ExitResult, 1),

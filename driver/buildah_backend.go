@@ -14,7 +14,7 @@ type BuildahBackend interface {
 	Available() (bool, string)
 	Pull(ctx context.Context, image string, force bool) error
 	Inspect(ctx context.Context, image string) (*ImageConfig, error)
-	From(ctx context.Context, image string) (string, error)
+	From(ctx context.Context, image string, dest string) (string, error)
 	Mount(ctx context.Context, containerID string) (string, error)
 	Unmount(ctx context.Context, containerID string) error
 	Remove(ctx context.Context, containerID string) error

@@ -6,6 +6,7 @@ require (
 	github.com/google/go-containerregistry v0.21.6
 	github.com/hashicorp/go-hclog v1.6.3
 	github.com/hashicorp/nomad v1.11.1
+	golang.org/x/sys v0.44.0
 )
 
 require (
@@ -118,7 +119,6 @@ require (
 	golang.org/x/mod v0.36.0 // indirect
 	golang.org/x/net v0.54.0 // indirect
 	golang.org/x/sync v0.20.0 // indirect
-	golang.org/x/sys v0.44.0 // indirect
 	golang.org/x/text v0.37.0 // indirect
 	golang.org/x/time v0.14.0 // indirect
 	golang.org/x/tools v0.45.0 // indirect
