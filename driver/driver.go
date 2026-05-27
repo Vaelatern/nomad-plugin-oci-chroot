@@ -952,6 +952,110 @@ func (d *OCIDriver) ExecTask(taskID string, cmd []string, timeout time.Duration)
 	}, nil
 }
 
+func (d *OCIDriver) ExecTaskStreaming(ctx context.Context, taskID string, execOptions *drivers.ExecOptions) (*drivers.ExitResult, error) {
+	d.logger.Debug("ExecTaskStreaming called", "task_id", taskID, "cmd", execOptions.Command)
+
+	d.tasksLock.Lock()
+	handle, ok := d.tasks[taskID]
+	d.tasksLock.Unlock()
+
+	if !ok {
+		d.logger.Warn("ExecTaskStreaming: task not found", "task_id", taskID)
+		return nil, fmt.Errorf("task not found: %s", taskID)
+	}
+
+	if handle.done {
+		d.logger.Warn("ExecTaskStreaming: task already finished", "task_id", taskID)
+		return nil, fmt.Errorf("task %s is not running", taskID)
+	}
+
+	if len(execOptions.Command) == 0 || execOptions.Command[0] == "" {
+		return nil, fmt.Errorf("exec command must not be empty")
+	}
+
+	mountPoint := handle.mountPoint
+	if mountPoint == "" {
+		d.logger.Error("ExecTaskStreaming: mount point unknown for task", "task_id", taskID)
+		return nil, fmt.Errorf("mount point unknown for task %s", taskID)
+	}
+
+	cmd := execOptions.Command
+	var execArgs []string
+	if len(cmd) > 1 {
+		execArgs = cmd[1:]
+	}
+	argsJSON, err := json.Marshal(execArgs)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal exec args: %v", err)
+	}
+	argsB64 := base64.StdEncoding.EncodeToString(argsJSON)
+
+	selfExe, err := os.Executable()
+	if err != nil {
+		return nil, fmt.Errorf("cannot find own executable: %v", err)
+	}
+
+	env := handle.taskConfig.EnvList()
+	env = append(env,
+		"_OCI_CHROOT_EXEC=1",
+		"_OCI_CHROOT_MOUNTPOINT="+mountPoint,
+		"_OCI_CHROOT_COMMAND="+cmd[0],
+		"_OCI_CHROOT_ARGS="+argsB64,
+		"_OCI_CHROOT_WORKDIR=",
+	)
+
+	if handle.netnsPath != "" {
+		env = append(env, "_OCI_CHROOT_NETNS="+handle.netnsPath)
+	}
+
+	env = append(env,
+		"_OCI_CHROOT_BIND_SOCKETS=",
+		"_OCI_CHROOT_DIRS=",
+	)
+
+	d.logger.Debug("ExecTaskStreaming: spawning chroot executor",
+		"command", cmd[0],
+		"args", execArgs,
+		"mountpoint", mountPoint,
+		"netns", handle.netnsPath,
+	)
+
+	execCmd := exec.CommandContext(ctx, selfExe)
+	execCmd.Env = env
+	execCmd.Stdout = execOptions.Stdout
+	execCmd.Stderr = execOptions.Stderr
+	execCmd.Stdin = execOptions.Stdin
+
+	if err := execCmd.Start(); err != nil {
+		return nil, fmt.Errorf("failed to spawn exec process: %v", err)
+	}
+
+	err = execCmd.Wait()
+
+	exitCode := 0
+	var signal int32
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			exitCode = exitErr.ExitCode()
+			if ws, ok := exitErr.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
+				signal = int32(ws.Signal())
+			}
+		} else {
+			exitCode = -1
+		}
+	}
+
+	d.logger.Debug("ExecTaskStreaming: completed",
+		"exit_code", exitCode,
+		"signal", signal,
+	)
+
+	return &drivers.ExitResult{
+		ExitCode: exitCode,
+		Signal:   int(signal),
+	}, nil
+}
+
 func (d *OCIDriver) Shutdown() error {
 	d.logger.Info("Shutdown called — stopping all tasks and cleaning up")
 	d.cancel()

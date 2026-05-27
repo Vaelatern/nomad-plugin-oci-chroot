@@ -140,6 +140,12 @@ func chrootExec() {
 	if err := syscall.Mknod(mp("/dev/urandom"), syscall.S_IFCHR|0666, mkdev(1, 9)); err != nil {
 		fmt.Fprintf(os.Stderr, "[oci-chroot] WARN: mknod /dev/urandom failed: %v\n", err)
 	}
+	if err := syscall.Mknod(mp("/dev/full"), syscall.S_IFCHR|0666, mkdev(1, 7)); err != nil {
+		fmt.Fprintf(os.Stderr, "[oci-chroot] WARN: mknod /dev/full failed: %v\n", err)
+	}
+	if err := syscall.Mknod(mp("/dev/tty"), syscall.S_IFCHR|0666, mkdev(5, 0)); err != nil {
+		fmt.Fprintf(os.Stderr, "[oci-chroot] WARN: mknod /dev/tty failed: %v\n", err)
+	}
 	mountTmpfs(mp("/dev/pts"), "1M")
 	if err := syscall.Mount("devpts", mp("/dev/pts"), "devpts", 0, "mode=0620,ptmxmode=0666"); err != nil {
 		fmt.Fprintf(os.Stderr, "[oci-chroot] WARN: mount /dev/pts failed: %v\n", err)
