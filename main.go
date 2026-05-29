@@ -33,10 +33,6 @@ func ensureDir(path string, mode os.FileMode) {
 	}
 }
 
-func mkdev(major, minor int) int {
-	return (((major) & 0xFFFFFFF) << 32) | ((minor) & 0xFFFFFFFF)
-}
-
 func mountTmpfs(path string, size string) {
 	ensureDir(path, 0755)
 	if err := syscall.Mount("tmpfs", path, "tmpfs", 0, "size="+size+",mode=0755"); err != nil {
@@ -51,126 +47,136 @@ func bindMount(src, dst string) {
 	}
 }
 
+func logf(quiet bool, format string, args ...interface{}) {
+	if !quiet {
+		fmt.Fprintf(os.Stderr, format, args...)
+	}
+}
+
 func chrootExec() {
-	fmt.Fprintf(os.Stderr, "[oci-chroot] === chroot executor started ===\n")
+	quiet := os.Getenv("_OCI_CHROOT_QUIET") == "1"
+	logf(quiet, "[oci-chroot] === chroot executor started ===\n")
 
 	mountPoint := os.Getenv("_OCI_CHROOT_MOUNTPOINT")
 	if mountPoint == "" {
-		fmt.Fprintf(os.Stderr, "[oci-chroot] FATAL: _OCI_CHROOT_MOUNTPOINT not set — cannot chroot\n")
+		logf(quiet, "[oci-chroot] FATAL: _OCI_CHROOT_MOUNTPOINT not set — cannot chroot\n")
 		os.Exit(1)
 	}
-	fmt.Fprintf(os.Stderr, "[oci-chroot] mount point: %s\n", mountPoint)
+	logf(quiet, "[oci-chroot] mount point: %s\n", mountPoint)
 
 	// Verify mount point exists
 	if _, err := os.Stat(mountPoint); err != nil {
-		fmt.Fprintf(os.Stderr, "[oci-chroot] FATAL: mount point %s does not exist: %v\n", mountPoint, err)
+		logf(quiet, "[oci-chroot] FATAL: mount point %s does not exist: %v\n", mountPoint, err)
 		os.Exit(1)
 	}
-	fmt.Fprintf(os.Stderr, "[oci-chroot] mount point verified\n")
+	logf(quiet, "[oci-chroot] mount point verified\n")
 
 	// Enter network namespace if requested (bridge/group network mode)
 	netnsPath := os.Getenv("_OCI_CHROOT_NETNS")
 	if netnsPath != "" {
-		fmt.Fprintf(os.Stderr, "[oci-chroot] joining network namespace: %s\n", netnsPath)
+		logf(quiet, "[oci-chroot] joining network namespace: %s\n", netnsPath)
 		f, err := os.Open(netnsPath)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "[oci-chroot] FATAL: cannot open netns %s: %v\n", netnsPath, err)
+			logf(quiet, "[oci-chroot] FATAL: cannot open netns %s: %v\n", netnsPath, err)
 			os.Exit(1)
 		}
 		if err := unix.Setns(int(f.Fd()), unix.CLONE_NEWNET); err != nil {
 			f.Close()
-			fmt.Fprintf(os.Stderr, "[oci-chroot] FATAL: setns(CLONE_NEWNET) failed for %s: %v\n", netnsPath, err)
+			logf(quiet, "[oci-chroot] FATAL: setns(CLONE_NEWNET) failed for %s: %v\n", netnsPath, err)
 			os.Exit(1)
 		}
 		f.Close()
-		fmt.Fprintf(os.Stderr, "[oci-chroot] network namespace joined: %s\n", netnsPath)
+		logf(quiet, "[oci-chroot] network namespace joined: %s\n", netnsPath)
 	} else {
-		fmt.Fprintf(os.Stderr, "[oci-chroot] no network namespace to join (host/group networking)\n")
+		logf(quiet, "[oci-chroot] no network namespace to join (host/group networking)\n")
 	}
 
 	// Check what's in the mount point
 	entries, _ := os.ReadDir(mountPoint)
-	fmt.Fprintf(os.Stderr, "[oci-chroot] rootfs contents (%d entries):\n", len(entries))
+	logf(quiet, "[oci-chroot] rootfs contents (%d entries):\n", len(entries))
 	for i, e := range entries {
 		if i >= 20 {
-			fmt.Fprintf(os.Stderr, "[oci-chroot]   ... and %d more\n", len(entries)-i)
+			logf(quiet, "[oci-chroot]   ... and %d more\n", len(entries)-i)
 			break
 		}
-		fmt.Fprintf(os.Stderr, "[oci-chroot]   %s\n", e.Name())
+		logf(quiet, "[oci-chroot]   %s\n", e.Name())
 	}
 
 	// Check for /bin/sh in the chroot
 	if _, err := os.Stat(mountPoint + "/bin/sh"); err == nil {
-		fmt.Fprintf(os.Stderr, "[oci-chroot] /bin/sh exists in rootfs\n")
+		logf(quiet, "[oci-chroot] /bin/sh exists in rootfs\n")
 	}
 
 	if err := syscall.Unshare(syscall.CLONE_NEWNS); err != nil {
-		fmt.Fprintf(os.Stderr, "[oci-chroot] FATAL: failed to unshare mount namespace: %v\n", err)
+		logf(quiet, "[oci-chroot] FATAL: failed to unshare mount namespace: %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Fprintf(os.Stderr, "[oci-chroot] mount namespace unshared\n")
+	logf(quiet, "[oci-chroot] mount namespace unshared\n")
 
 	if err := syscall.Mount("", "/", "", syscall.MS_PRIVATE|syscall.MS_REC, ""); err != nil {
-		fmt.Fprintf(os.Stderr, "[oci-chroot] WARN: failed to make / private: %v\n", err)
+		logf(quiet, "[oci-chroot] WARN: failed to make / private: %v\n", err)
 	} else {
-		fmt.Fprintf(os.Stderr, "[oci-chroot] root mount set to private\n")
+		logf(quiet, "[oci-chroot] root mount set to private\n")
 	}
 
 	mp := func(p string) string { return mountPoint + p }
 
 	// Mount /proc
-	fmt.Fprintf(os.Stderr, "[oci-chroot] mounting /proc\n")
+	logf(quiet, "[oci-chroot] mounting /proc\n")
 	mountTmpfs(mp("/proc"), "0")
 	if err := syscall.Mount("proc", mp("/proc"), "proc", 0, ""); err != nil {
-		fmt.Fprintf(os.Stderr, "[oci-chroot] WARN: mount /proc failed: %v\n", err)
+		logf(quiet, "[oci-chroot] WARN: mount /proc failed: %v\n", err)
 	}
 
 	// Mount /dev
-	fmt.Fprintf(os.Stderr, "[oci-chroot] mounting /dev\n")
+	logf(quiet, "[oci-chroot] mounting /dev\n")
 	mountTmpfs(mp("/dev"), "10M")
+	mkdev := func(major, minor uint32) int {
+		return int(unix.Mkdev(major, minor))
+	}
 	if err := syscall.Mknod(mp("/dev/null"), syscall.S_IFCHR|0666, mkdev(1, 3)); err != nil {
-		fmt.Fprintf(os.Stderr, "[oci-chroot] WARN: mknod /dev/null failed: %v\n", err)
+		logf(quiet, "[oci-chroot] WARN: mknod /dev/null failed: %v\n", err)
 	}
 	if err := syscall.Mknod(mp("/dev/zero"), syscall.S_IFCHR|0666, mkdev(1, 5)); err != nil {
-		fmt.Fprintf(os.Stderr, "[oci-chroot] WARN: mknod /dev/zero failed: %v\n", err)
+		logf(quiet, "[oci-chroot] WARN: mknod /dev/zero failed: %v\n", err)
 	}
 	if err := syscall.Mknod(mp("/dev/random"), syscall.S_IFCHR|0666, mkdev(1, 8)); err != nil {
-		fmt.Fprintf(os.Stderr, "[oci-chroot] WARN: mknod /dev/random failed: %v\n", err)
+		logf(quiet, "[oci-chroot] WARN: mknod /dev/random failed: %v\n", err)
 	}
 	if err := syscall.Mknod(mp("/dev/urandom"), syscall.S_IFCHR|0666, mkdev(1, 9)); err != nil {
-		fmt.Fprintf(os.Stderr, "[oci-chroot] WARN: mknod /dev/urandom failed: %v\n", err)
+		logf(quiet, "[oci-chroot] WARN: mknod /dev/urandom failed: %v\n", err)
 	}
 	if err := syscall.Mknod(mp("/dev/full"), syscall.S_IFCHR|0666, mkdev(1, 7)); err != nil {
-		fmt.Fprintf(os.Stderr, "[oci-chroot] WARN: mknod /dev/full failed: %v\n", err)
+		logf(quiet, "[oci-chroot] WARN: mknod /dev/full failed: %v\n", err)
 	}
 	if err := syscall.Mknod(mp("/dev/tty"), syscall.S_IFCHR|0666, mkdev(5, 0)); err != nil {
-		fmt.Fprintf(os.Stderr, "[oci-chroot] WARN: mknod /dev/tty failed: %v\n", err)
+		logf(quiet, "[oci-chroot] WARN: mknod /dev/tty failed: %v\n", err)
 	}
 	mountTmpfs(mp("/dev/pts"), "1M")
 	if err := syscall.Mount("devpts", mp("/dev/pts"), "devpts", 0, "mode=0620,ptmxmode=0666"); err != nil {
-		fmt.Fprintf(os.Stderr, "[oci-chroot] WARN: mount /dev/pts failed: %v\n", err)
+		logf(quiet, "[oci-chroot] WARN: mount /dev/pts failed: %v\n", err)
 	}
 	mountTmpfs(mp("/dev/shm"), "64M")
 	if err := syscall.Mount("tmpfs", mp("/dev/shm"), "tmpfs", 0, "size=64M,mode=1777"); err != nil {
-		fmt.Fprintf(os.Stderr, "[oci-chroot] WARN: mount /dev/shm failed: %v\n", err)
+		logf(quiet, "[oci-chroot] WARN: mount /dev/shm failed: %v\n", err)
 	}
 
 	// Mount /tmp
-	fmt.Fprintf(os.Stderr, "[oci-chroot] mounting /tmp\n")
+	logf(quiet, "[oci-chroot] mounting /tmp\n")
 	mountTmpfs(mp("/tmp"), "100M")
 	if err := syscall.Mount("tmpfs", mp("/tmp"), "tmpfs", 0, "size=100M,mode=1777"); err != nil {
-		fmt.Fprintf(os.Stderr, "[oci-chroot] WARN: mount /tmp failed: %v\n", err)
+		logf(quiet, "[oci-chroot] WARN: mount /tmp failed: %v\n", err)
 	}
 
 	// Mount /sys
-	fmt.Fprintf(os.Stderr, "[oci-chroot] mounting /sys\n")
+	logf(quiet, "[oci-chroot] mounting /sys\n")
 	mountTmpfs(mp("/sys"), "0")
 	if err := syscall.Mount("sysfs", mp("/sys"), "sysfs", 0, ""); err != nil {
-		fmt.Fprintf(os.Stderr, "[oci-chroot] WARN: mount /sys failed: %v\n", err)
+		logf(quiet, "[oci-chroot] WARN: mount /sys failed: %v\n", err)
 	}
 
 	// Mount /run (needed for Alpine /var/run -> ../run symlink and socket bind-mounts)
-	fmt.Fprintf(os.Stderr, "[oci-chroot] mounting /run\n")
+	logf(quiet, "[oci-chroot] mounting /run\n")
 	mountTmpfs(mp("/run"), "10M")
 
 	// Bind-mount task directories from host (NOMAD_ALLOC_DIR, NOMAD_TASK_DIR, NOMAD_SECRETS_DIR)
@@ -178,34 +184,34 @@ func chrootExec() {
 	if dirsB64 != "" {
 		js, err := base64.StdEncoding.DecodeString(dirsB64)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "[oci-chroot] WARN: failed to decode dirs: %v\n", err)
+			logf(quiet, "[oci-chroot] WARN: failed to decode dirs: %v\n", err)
 		} else {
 			var dirs map[string]string
 			if err := json.Unmarshal(js, &dirs); err != nil {
-				fmt.Fprintf(os.Stderr, "[oci-chroot] WARN: failed to parse dirs JSON: %v\n", err)
+				logf(quiet, "[oci-chroot] WARN: failed to parse dirs JSON: %v\n", err)
 			} else {
-				fmt.Fprintf(os.Stderr, "[oci-chroot] bind-mounting %d host directories:\n", len(dirs))
+				logf(quiet, "[oci-chroot] bind-mounting %d host directories:\n", len(dirs))
 				for chrootPath, hostPath := range dirs {
-					fmt.Fprintf(os.Stderr, "[oci-chroot]   %s <- %s", chrootPath, hostPath)
+					logf(quiet, "[oci-chroot]   %s <- %s", chrootPath, hostPath)
 					if _, err := os.Stat(hostPath); err != nil {
-						fmt.Fprintf(os.Stderr, " (HOST PATH NOT FOUND: %v)\n", err)
+						logf(quiet, " (HOST PATH NOT FOUND: %v)\n", err)
 						continue
 					}
-					fmt.Fprintf(os.Stderr, "\n")
+					logf(quiet, "\n")
 					dst := mp(chrootPath)
 					os.RemoveAll(dst)
 					ensureDir(dst, 0755)
 					if err := syscall.Mount(hostPath, dst, "", syscall.MS_BIND, ""); err != nil {
-						fmt.Fprintf(os.Stderr, "[oci-chroot]   ERROR: bind mount failed: %v\n", err)
+						logf(quiet, "[oci-chroot]   ERROR: bind mount failed: %v\n", err)
 					} else {
-						fmt.Fprintf(os.Stderr, "[oci-chroot]   -> mounted at %s\n", dst)
+						logf(quiet, "[oci-chroot]   -> mounted at %s\n", dst)
 					}
 				}
-				fmt.Fprintf(os.Stderr, "[oci-chroot] note: Nomad template stanzas render to /local and /secrets — these paths are now available inside the chroot\n")
+				logf(quiet, "[oci-chroot] note: Nomad template stanzas render to /local and /secrets — these paths are now available inside the chroot\n")
 			}
 		}
 	} else {
-		fmt.Fprintf(os.Stderr, "[oci-chroot] no host directories to bind-mount\n")
+		logf(quiet, "[oci-chroot] no host directories to bind-mount\n")
 	}
 
 	// Bind-mount sockets from host
@@ -213,75 +219,75 @@ func chrootExec() {
 	if socketsB64 != "" {
 		js, err := base64.StdEncoding.DecodeString(socketsB64)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "[oci-chroot] WARN: failed to decode sockets: %v\n", err)
+			logf(quiet, "[oci-chroot] WARN: failed to decode sockets: %v\n", err)
 		} else {
 			var sockets []string
 			if err := json.Unmarshal(js, &sockets); err != nil {
-				fmt.Fprintf(os.Stderr, "[oci-chroot] WARN: failed to parse sockets JSON: %v\n", err)
+				logf(quiet, "[oci-chroot] WARN: failed to parse sockets JSON: %v\n", err)
 			} else {
-				fmt.Fprintf(os.Stderr, "[oci-chroot] bind-mounting %d host sockets:\n", len(sockets))
+				logf(quiet, "[oci-chroot] bind-mounting %d host sockets:\n", len(sockets))
 				for _, sockPath := range sockets {
 					if _, err := os.Stat(sockPath); err != nil {
-						fmt.Fprintf(os.Stderr, "[oci-chroot]   %s not found on host, skipping\n", sockPath)
+						logf(quiet, "[oci-chroot]   %s not found on host, skipping\n", sockPath)
 						continue
 					}
 					dst := mp(sockPath)
 					ensureDir(filepath.Dir(dst), 0755)
 					os.WriteFile(dst, nil, 0644)
 					if err := syscall.Mount(sockPath, dst, "", syscall.MS_BIND, ""); err != nil {
-						fmt.Fprintf(os.Stderr, "[oci-chroot]   ERROR: bind mount socket %s -> %s failed: %v\n", sockPath, dst, err)
+						logf(quiet, "[oci-chroot]   ERROR: bind mount socket %s -> %s failed: %v\n", sockPath, dst, err)
 					} else {
-						fmt.Fprintf(os.Stderr, "[oci-chroot]   socket mounted: %s -> %s\n", sockPath, dst)
+						logf(quiet, "[oci-chroot]   socket mounted: %s -> %s\n", sockPath, dst)
 					}
 				}
 			}
 		}
 	} else {
-		fmt.Fprintf(os.Stderr, "[oci-chroot] no host sockets to bind-mount\n")
+		logf(quiet, "[oci-chroot] no host sockets to bind-mount\n")
 	}
 
 	// Copy host resolv.conf into chroot so DNS works inside the chroot
 	if data, err := os.ReadFile("/etc/resolv.conf"); err == nil {
-		fmt.Fprintf(os.Stderr, "[oci-chroot] copying /etc/resolv.conf into chroot\n")
+		logf(quiet, "[oci-chroot] copying /etc/resolv.conf into chroot\n")
 		dst := mp("/etc/resolv.conf")
 		os.MkdirAll(filepath.Dir(dst), 0755)
 		if err := os.WriteFile(dst, data, 0644); err != nil {
-			fmt.Fprintf(os.Stderr, "[oci-chroot] WARN: failed to write resolv.conf into chroot: %v\n", err)
+			logf(quiet, "[oci-chroot] WARN: failed to write resolv.conf into chroot: %v\n", err)
 		}
 	} else {
-		fmt.Fprintf(os.Stderr, "[oci-chroot] /etc/resolv.conf not found on host, skipping\n")
+		logf(quiet, "[oci-chroot] /etc/resolv.conf not found on host, skipping\n")
 	}
 
-	fmt.Fprintf(os.Stderr, "[oci-chroot] all mounts complete, performing chroot into %s\n", mountPoint)
+	logf(quiet, "[oci-chroot] all mounts complete, performing chroot into %s\n", mountPoint)
 	if err := syscall.Chroot(mountPoint); err != nil {
-		fmt.Fprintf(os.Stderr, "[oci-chroot] FATAL: chroot into %s failed: %v\n", mountPoint, err)
+		logf(quiet, "[oci-chroot] FATAL: chroot into %s failed: %v\n", mountPoint, err)
 		os.Exit(1)
 	}
-	fmt.Fprintf(os.Stderr, "[oci-chroot] chroot successful, changing to /\n")
+	logf(quiet, "[oci-chroot] chroot successful, changing to /\n")
 	if err := os.Chdir("/"); err != nil {
-		fmt.Fprintf(os.Stderr, "[oci-chroot] FATAL: chdir to / after chroot failed: %v\n", err)
+		logf(quiet, "[oci-chroot] FATAL: chdir to / after chroot failed: %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Fprintf(os.Stderr, "[oci-chroot] inside chroot, listing /\n")
+	logf(quiet, "[oci-chroot] inside chroot, listing /\n")
 	if entries, err := os.ReadDir("/"); err == nil {
 		for _, e := range entries {
-			fmt.Fprintf(os.Stderr, "[oci-chroot]   /%s\n", e.Name())
+			logf(quiet, "[oci-chroot]   /%s\n", e.Name())
 		}
 	}
 
 	// Change to WORKDIR if set
 	workDir := os.Getenv("_OCI_CHROOT_WORKDIR")
 	if workDir != "" {
-		fmt.Fprintf(os.Stderr, "[oci-chroot] changing to workdir: %s\n", workDir)
+		logf(quiet, "[oci-chroot] changing to workdir: %s\n", workDir)
 		if _, err := os.Stat(workDir); err != nil {
-			fmt.Fprintf(os.Stderr, "[oci-chroot] WARN: workdir %s does not exist: %v\n", workDir, err)
+			logf(quiet, "[oci-chroot] WARN: workdir %s does not exist: %v\n", workDir, err)
 		} else if err := os.Chdir(workDir); err != nil {
-			fmt.Fprintf(os.Stderr, "[oci-chroot] WARN: chdir to workdir %s failed: %v\n", workDir, err)
+			logf(quiet, "[oci-chroot] WARN: chdir to workdir %s failed: %v\n", workDir, err)
 		} else {
-			fmt.Fprintf(os.Stderr, "[oci-chroot] working directory is now: %s\n", workDir)
+			logf(quiet, "[oci-chroot] working directory is now: %s\n", workDir)
 		}
 	} else {
-		fmt.Fprintf(os.Stderr, "[oci-chroot] no WORKDIR set, staying at /\n")
+		logf(quiet, "[oci-chroot] no WORKDIR set, staying at /\n")
 	}
 
 	cmd := os.Getenv("_OCI_CHROOT_COMMAND")
@@ -290,7 +296,7 @@ func chrootExec() {
 	if argsB64 != "" {
 		js, err := base64.StdEncoding.DecodeString(argsB64)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "[oci-chroot] WARN: failed to decode args: %v\n", err)
+			logf(quiet, "[oci-chroot] WARN: failed to decode args: %v\n", err)
 		} else {
 			json.Unmarshal(js, &args)
 		}
@@ -340,14 +346,14 @@ func chrootExec() {
 		env = append(env, "PATH=/usr/local/bin:/usr/bin:/bin")
 	}
 
-	fmt.Fprintf(os.Stderr, "[oci-chroot] executing task:\n")
-	fmt.Fprintf(os.Stderr, "[oci-chroot]   command: %s\n", cmd)
-	fmt.Fprintf(os.Stderr, "[oci-chroot]   args: %v\n", args[1:])
-	fmt.Fprintf(os.Stderr, "[oci-chroot]   env vars: %d total\n", len(env))
-	fmt.Fprintf(os.Stderr, "[oci-chroot] === chroot exec ===\n")
+	logf(quiet, "[oci-chroot] executing task:\n")
+	logf(quiet, "[oci-chroot]   command: %s\n", cmd)
+	logf(quiet, "[oci-chroot]   args: %v\n", args[1:])
+	logf(quiet, "[oci-chroot]   env vars: %d total\n", len(env))
+	logf(quiet, "[oci-chroot] === chroot exec ===\n")
 
 	if err := syscall.Exec(cmd, args, env); err != nil {
-		fmt.Fprintf(os.Stderr, "[oci-chroot] FATAL: exec of %s failed: %v\n", cmd, err)
+		logf(quiet, "[oci-chroot] FATAL: exec of %s failed: %v\n", cmd, err)
 		os.Exit(1)
 	}
 }

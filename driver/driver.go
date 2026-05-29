@@ -15,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/creack/pty"
 	"github.com/hashicorp/go-hclog"
 	cstructs "github.com/hashicorp/nomad/client/structs"
 	"github.com/hashicorp/nomad/plugins/base"
@@ -1020,6 +1021,94 @@ func (d *OCIDriver) ExecTaskStreaming(ctx context.Context, taskID string, execOp
 		"netns", handle.netnsPath,
 	)
 
+	if execOptions.Tty {
+		env = append(env, "_OCI_CHROOT_QUIET=1")
+		return d.execTTY(ctx, selfExe, env, execOptions)
+	}
+
+	return d.execPipe(ctx, selfExe, env, execOptions)
+}
+
+func (d *OCIDriver) execTTY(ctx context.Context, selfExe string, env []string, execOptions *drivers.ExecOptions) (*drivers.ExitResult, error) {
+	master, slave, err := pty.Open()
+	if err != nil {
+		return nil, fmt.Errorf("failed to open PTY: %v", err)
+	}
+	defer master.Close()
+	defer slave.Close()
+
+	select {
+	case resize := <-execOptions.ResizeCh:
+		pty.Setsize(master, &pty.Winsize{
+			Rows: uint16(resize.Height),
+			Cols: uint16(resize.Width),
+		})
+	default:
+	}
+
+	execCmd := exec.CommandContext(ctx, selfExe)
+	execCmd.Env = env
+	execCmd.Stdin = slave
+	execCmd.Stdout = slave
+	execCmd.Stderr = slave
+	execCmd.SysProcAttr = &syscall.SysProcAttr{
+		Setctty: true,
+		Ctty:    0,
+		Setsid:  true,
+	}
+
+	if err := execCmd.Start(); err != nil {
+		return nil, fmt.Errorf("failed to start exec process: %v", err)
+	}
+
+	slave.Close()
+
+	go func() {
+		for resize := range execOptions.ResizeCh {
+			pty.Setsize(master, &pty.Winsize{
+				Rows: uint16(resize.Height),
+				Cols: uint16(resize.Width),
+			})
+		}
+	}()
+
+	if execOptions.Stdin != nil {
+		go func() {
+			io.Copy(master, execOptions.Stdin)
+		}()
+	}
+
+	go func() {
+		io.Copy(execOptions.Stdout, master)
+	}()
+
+	err = execCmd.Wait()
+
+	exitCode := 0
+	var sig int32
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			exitCode = exitErr.ExitCode()
+			if ws, ok := exitErr.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
+				sig = int32(ws.Signal())
+			}
+		} else {
+			exitCode = -1
+		}
+	}
+
+	d.logger.Debug("ExecTaskStreaming: completed",
+		"exit_code", exitCode,
+		"signal", sig,
+	)
+
+	return &drivers.ExitResult{
+		ExitCode: exitCode,
+		Signal:   int(sig),
+	}, nil
+}
+
+func (d *OCIDriver) execPipe(ctx context.Context, selfExe string, env []string, execOptions *drivers.ExecOptions) (*drivers.ExitResult, error) {
 	execCmd := exec.CommandContext(ctx, selfExe)
 	execCmd.Env = env
 	execCmd.Stdout = execOptions.Stdout
@@ -1030,29 +1119,24 @@ func (d *OCIDriver) ExecTaskStreaming(ctx context.Context, taskID string, execOp
 		return nil, fmt.Errorf("failed to spawn exec process: %v", err)
 	}
 
-	err = execCmd.Wait()
+	err := execCmd.Wait()
 
 	exitCode := 0
-	var signal int32
+	var sig int32
 	if err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {
 			exitCode = exitErr.ExitCode()
 			if ws, ok := exitErr.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
-				signal = int32(ws.Signal())
+				sig = int32(ws.Signal())
 			}
 		} else {
 			exitCode = -1
 		}
 	}
 
-	d.logger.Debug("ExecTaskStreaming: completed",
-		"exit_code", exitCode,
-		"signal", signal,
-	)
-
 	return &drivers.ExitResult{
 		ExitCode: exitCode,
-		Signal:   int(signal),
+		Signal:   int(sig),
 	}, nil
 }
 
